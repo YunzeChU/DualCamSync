@@ -4,16 +4,22 @@ import UIKit
 
 /// 主界面：双摄预览 + 液态玻璃控制层
 /// -------------------------------------------------------------
-/// 结构仿 iPhone 原生相机：
-///  - 底层：双相机实时预览（分屏 / 画中画，可一键切换）
-///  - 上层：液态玻璃控件（顶部功能按钮、录制中红色计时、底部快门 + 镜头选择）
-///  - 横屏时控件栏移到右侧（原生相机横屏布局，竖屏/横屏观感不同）
-///  - 点按预览任意位置 = 该路点按对焦+点测光；点按角标锁图标 = 锁定 AE/AF
+/// 结构仿 iPhone 原生相机（竖屏底部三键 / 横屏右侧三键）：
+///  - 底层：双相机实时预览（分屏 / 画中画，默认画中画）
+///  - 上层：液态玻璃控件：功能键 / 录制键 / 设置键 + 录制中红色计时
+///  - 功能键 → 功能面板：镜头A/B、布局、录制模式、分辨率（二级菜单）
+///  - 设置键 → 设置面板：AE/AF锁定、杜比视界HDR、空间音频、防抖、曝光补偿
+///
+/// 本轮修复要点：
+///  1. 界面极简为 3 个按钮（用户要求"越少越好"）；
+///  2. 预览层纯显示、不拦截触摸（修复按键点不动/不灵敏）；
+///  3. 预览布局用稳定结构，旋转/切布局不重建容器（修复黑屏）；
+///  4. 移除预览画面上的镜头角标（用户认为多余、占空间）。
 struct CameraView: View {
     @StateObject private var camera = CameraManager()
     @Environment(\.scenePhase) private var scenePhase
 
-    @State private var pickerSlot: CameraSlot?
+    @State private var showingFunction = false
     @State private var showingSettings = false
 
     var body: some View {
@@ -22,33 +28,29 @@ struct CameraView: View {
             ZStack {
                 Color.black.ignoresSafeArea()
 
-                // 底层：双摄预览
+                // 底层：双摄预览（稳定结构，旋转不重建容器）
                 previewArea(geo: geo, isLandscape: isLandscape)
 
-                // 上层：液态玻璃控制层
+                // 上层：三键控制层（竖屏底部横排 / 横屏右侧竖排）
                 controlOverlay(isLandscape: isLandscape)
 
-                // 选摄面板（液态玻璃）
-                if let slot = pickerSlot {
+                // 录制中红色计时（顶部居中）
+                recordingTimerView
+
+                // 功能面板（液态玻璃二级菜单）
+                if showingFunction {
                     overlayDim()
-                        .onTapGesture { withAnimation(.snappy) { pickerSlot = nil } }
-                    CameraPickerPanel(slot: slot) { option in
-                        camera.selectCamera(option, for: slot)
-                        withAnimation(.snappy) { pickerSlot = nil }
-                    } onDismiss: {
-                        withAnimation(.snappy) { pickerSlot = nil }
-                    }
-                    .transition(.scale(scale: 0.92).combined(with: .opacity))
+                        .onTapGesture { dismissAllPanels() }
+                    FunctionPanel { dismissAllPanels() }
+                        .transition(.scale(scale: 0.88).combined(with: .opacity))
                 }
 
-                // 设置面板（液态玻璃）
+                // 设置面板（液态玻璃弹层）
                 if showingSettings {
                     overlayDim()
-                        .onTapGesture { withAnimation(.snappy) { showingSettings = false } }
-                    SettingsPanel {
-                        withAnimation(.snappy) { showingSettings = false }
-                    }
-                    .transition(.scale(scale: 0.92).combined(with: .opacity))
+                        .onTapGesture { dismissAllPanels() }
+                    SettingsPanel { dismissAllPanels() }
+                        .transition(.scale(scale: 0.88).combined(with: .opacity))
                 }
 
                 // 降级/提示横幅
@@ -57,9 +59,9 @@ struct CameraView: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
             }
+            .animation(.spring(response: 0.38, dampingFraction: 0.85), value: showingFunction)
+            .animation(.spring(response: 0.38, dampingFraction: 0.85), value: showingSettings)
             .animation(.snappy, value: camera.degradationBanner)
-            .animation(.snappy, value: pickerSlot)
-            .animation(.snappy, value: showingSettings)
         }
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
@@ -87,6 +89,14 @@ struct CameraView: View {
         .environmentObject(camera)
     }
 
+    /// 收起所有弹出面板（统一弹簧动画，保持原生手感）
+    private func dismissAllPanels() {
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+            showingFunction = false
+            showingSettings = false
+        }
+    }
+
     // MARK: - 方向同步
 
     private func syncOrientation() {
@@ -101,116 +111,124 @@ struct CameraView: View {
         camera.updateInterfaceOrientation(interface)
     }
 
-    // MARK: - 预览区域
+    // MARK: - 预览区域（稳定结构）
 
+    /// 用固定顺序的两个插槽 + 计算帧布局：
+    /// 旋转/切换布局时 ZStack 结构不变，SwiftUI 不会拆除重建预览容器，
+    /// 避免共享预览层被摘除导致黑屏（原 HStack/VStack 分支切换会重建）。
     @ViewBuilder
     private func previewArea(geo: GeometryProxy, isLandscape: Bool) -> some View {
-        switch camera.layout {
-        case .split:
-            // 等分双屏：竖屏上下、横屏左右
-            if isLandscape {
-                HStack(spacing: 2) {
-                    previewSlot(.a)
-                    previewSlot(.b)
-                }
-            } else {
-                VStack(spacing: 2) {
-                    previewSlot(.a)
-                    previewSlot(.b)
-                }
-            }
-        case .pictureInPicture:
-            // 画中画：A 全屏主画面，B 悬浮右下角
-            ZStack {
-                previewSlot(.a)
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        previewSlot(.b)
-                            .frame(width: geo.size.width * 0.34,
-                                   height: geo.size.height * 0.34)
-                            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
-                            .padding(20)
-                    }
-                }
-            }
+        ZStack(alignment: .topLeading) {
+            previewSlot(.a)
+                .frame(width: slotAWidth(geo, isLandscape),
+                       height: slotAHeight(geo, isLandscape))
+            previewSlot(.b)
+                .frame(width: slotBWidth(geo, isLandscape),
+                       height: slotBHeight(geo, isLandscape))
+                .offset(x: slotBX(geo, isLandscape), y: slotBY(geo, isLandscape))
+                .clipShape(camera.layout == .pictureInPicture
+                           ? RoundedRectangle(cornerRadius: 18, style: .continuous)
+                           : Rectangle())
         }
     }
 
-    /// 单路预览：画面 + 镜头角标 + 点按对焦
+    /// 单路预览：纯显示容器（不拦截触摸、无镜头角标）
     private func previewSlot(_ slot: CameraSlot) -> some View {
-        let layer = slot == .a ? camera.previewLayerA : camera.previewLayerB
-        let option = slot == .a ? camera.cameraA : camera.cameraB
-        return ZStack(alignment: .topLeading) {
-            PreviewLayerView(layer: layer)
-                .contentShape(Rectangle())
-                // 点按预览 = 该路点按对焦 + 点测光
-                .gesture(SpatialTapGesture().onEnded { value in
-                    let devicePoint = camera.devicePoint(for: value.location, in: layer)
-                    camera.focus(at: devicePoint, slot: slot)
-                })
-
-            CameraLabelView(name: option?.fullName ?? "—",
-                            locked: camera.lockState[slot.index]) {
-                camera.toggleLock(slot: slot)
-            }
-            .padding(12)
-        }
+        PreviewLayerView(layer: slot == .a ? camera.previewLayerA : camera.previewLayerB)
     }
 
-    // MARK: - 控制层
+    // MARK: 预览几何（分屏：A 占一半、B 占另一半；画中画：A 全屏、B 右下角）
+
+    private func slotAWidth(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
+        camera.layout == .pictureInPicture ? geo.size.width
+            : (landscape ? geo.size.width / 2 : geo.size.width)
+    }
+
+    private func slotAHeight(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
+        camera.layout == .pictureInPicture ? geo.size.height
+            : (landscape ? geo.size.height : geo.size.height / 2)
+    }
+
+    private func slotBWidth(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
+        if camera.layout == .pictureInPicture { return geo.size.width * 0.34 }
+        return landscape ? geo.size.width / 2 : geo.size.width
+    }
+
+    private func slotBHeight(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
+        if camera.layout == .pictureInPicture { return geo.size.height * 0.34 }
+        return landscape ? geo.size.height : geo.size.height / 2
+    }
+
+    private func slotBX(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
+        if camera.layout == .pictureInPicture {
+            return geo.size.width - slotBWidth(geo, landscape) - 20
+        }
+        return landscape ? geo.size.width / 2 : 0
+    }
+
+    private func slotBY(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
+        if camera.layout == .pictureInPicture {
+            return geo.size.height - slotBHeight(geo, landscape) - 20
+        }
+        return landscape ? 0 : geo.size.height / 2
+    }
+
+    // MARK: - 三键控制层
 
     @ViewBuilder
     private func controlOverlay(isLandscape: Bool) -> some View {
         if isLandscape {
-            // 横屏：控件栏在右侧（竖屏/横屏布局不同）
+            // 横屏：右侧竖排三键（功能 / 快门 / 设置）
             HStack {
                 Spacer()
-                VStack(spacing: 16) {
-                    topControls
+                VStack(spacing: 30) {
+                    GlassIconButton(systemImage: "rectangle.split.2x1") {
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
+                    }
+                    .disabled(camera.isRecording)
+                    .opacity(camera.isRecording ? 0.35 : 1)
                     Spacer()
-                    recordingTimerView
-                    bottomControls
-                }
-                .padding(.vertical, 18)
-                .padding(.horizontal, 14)
-            }
-        } else {
-            // 竖屏：顶部功能 + 底部快门
-            VStack {
-                HStack {
-                    topControls
+                    ShutterButton(isRecording: camera.isRecording) {
+                        camera.isRecording ? camera.stopRecording() : camera.startRecording()
+                    }
                     Spacer()
-                    recordingTimerView
+                    GlassIconButton(systemImage: "gearshape.fill") {
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
+                    }
+                    .disabled(camera.isRecording)
+                    .opacity(camera.isRecording ? 0.35 : 1)
                 }
                 .padding(.horizontal, 18)
-                .padding(.top, 14)
+                .padding(.vertical, 28)
+            }
+        } else {
+            // 竖屏：底部横排三键（功能 / 快门 / 设置）
+            VStack {
                 Spacer()
-                bottomControls
+                HStack(spacing: 40) {
+                    GlassIconButton(systemImage: "rectangle.split.2x1") {
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
+                    }
+                    .disabled(camera.isRecording)
+                    .opacity(camera.isRecording ? 0.35 : 1)
+                    ShutterButton(isRecording: camera.isRecording) {
+                        camera.isRecording ? camera.stopRecording() : camera.startRecording()
+                    }
+                    GlassIconButton(systemImage: "gearshape.fill") {
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
+                    }
+                    .disabled(camera.isRecording)
+                    .opacity(camera.isRecording ? 0.35 : 1)
+                }
+                .padding(.bottom, 46)
             }
         }
     }
 
-    /// 顶部功能按钮：布局切换 + 设置
-    private var topControls: some View {
-        HStack(spacing: 14) {
-            GlassIconButton(systemImage: camera.layout.systemImage) {
-                camera.setLayout(camera.layout == .split ? .pictureInPicture : .split)
-            }
-            GlassIconButton(systemImage: "gearshape.fill") {
-                withAnimation(.snappy) { showingSettings = true }
-            }
-        }
-        .disabled(camera.isRecording)
-        .opacity(camera.isRecording ? 0.4 : 1)
-    }
-
-    /// 录制中的红色计时（液态玻璃胶囊，仿原生相机）
-    @ViewBuilder
+    /// 录制中的红色计时（液态玻璃胶囊，仿原生相机；不拦截触摸）
     private var recordingTimerView: some View {
-        if camera.isRecording {
-            HStack(spacing: 6) {
+        HStack(spacing: 6) {
+            if camera.isRecording {
                 Circle()
                     .fill(.red)
                     .frame(width: 8, height: 8)
@@ -218,57 +236,14 @@ struct CameraView: View {
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.red)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 7)
-            .glassCapsule()
         }
-    }
-
-    /// 底部：镜头A选择 + 快门 + 镜头B选择
-    private var bottomControls: some View {
-        HStack(alignment: .center, spacing: 0) {
-            slotButton(.a)
-            Spacer()
-            VStack(spacing: 8) {
-                Text(camera.mode.displayName)
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.85))
-                ShutterButton(isRecording: camera.isRecording) {
-                    if camera.isRecording {
-                        camera.stopRecording()
-                    } else {
-                        camera.startRecording()
-                    }
-                }
-            }
-            Spacer()
-            slotButton(.b)
-        }
-        .padding(.horizontal, 26)
-        .padding(.bottom, 26)
-    }
-
-    /// 镜头选择按钮（液态玻璃胶囊）
-    private func slotButton(_ slot: CameraSlot) -> some View {
-        let option = slot == .a ? camera.cameraA : camera.cameraB
-        return Button {
-            withAnimation(.snappy) { pickerSlot = slot }
-        } label: {
-            HStack(spacing: 5) {
-                Text(option?.fullName ?? "—")
-                    .font(.system(size: 13, weight: .semibold))
-                    .lineLimit(1)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 9, weight: .semibold))
-            }
-            .foregroundStyle(.white)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 9)
-            .glassCapsule()
-        }
-        .buttonStyle(.plain)
-        .disabled(camera.isRecording)
-        .opacity(camera.isRecording ? 0.4 : 1)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .glassCapsule()
+        .opacity(camera.isRecording ? 1 : 0)
+        .allowsHitTesting(false)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(.top, 14)
     }
 
     /// 降级横幅

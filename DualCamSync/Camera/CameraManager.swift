@@ -41,7 +41,7 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var cameraA: CameraOption?
     @Published var cameraB: CameraOption?
     @Published var preset: ResolutionPreset = .uhd30
-    @Published var layout: PreviewLayout = .split
+    @Published var layout: PreviewLayout = .pictureInPicture   // 默认画中画
     @Published var mode: RecordingMode = .dualFiles
     @Published var dolbyVisionEnabled = false
     @Published var spatialAudioEnabled = true
@@ -496,9 +496,20 @@ final class CameraManager: NSObject, ObservableObject {
         applyDolbySetting()
     }
 
+    /// 杜比视界/普通 HEVC 输出设置 + HDR 采集管线开关
+    /// -------------------------------------------------------------
+    /// HDR（杜比视界）录制要真正生效，除了把编码器切到 dvhe，
+    /// 还必须让"采集 → 预览 → 录制"整条链路的视频 HDR 管线开启
+    /// （AVCaptureConnection.isVideoHDREnabled），否则文件虽然带
+    /// dvhe 容器、内容仍是 SDR，观感上不是 HDR。
     private func applyDolbySetting() {
+        let useDolby = dolbyVisionEnabled && isDolbyVisionAvailable
+        // 预览连接 + 录制连接统一开关视频 HDR 管线（设备不支持时是 no-op）
+        for conn in [previewConnA, previewConnB, activeVideoConnA, activeVideoConnB] {
+            conn?.isVideoHDREnabled = useDolby
+        }
         guard mode == .dualFiles, let outA = movieOutputA, let outB = movieOutputB else { return }
-        let codec: AVVideoCodecType = (dolbyVisionEnabled && isDolbyVisionAvailable) ? Self.dolbyVisionCodec : .hevc
+        let codec: AVVideoCodecType = useDolby ? Self.dolbyVisionCodec : .hevc
         for out in [outA, outB] {
             for conn in out.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
                 out.setOutputSettings([AVVideoCodecKey: codec], for: conn)
@@ -599,6 +610,13 @@ final class CameraManager: NSObject, ObservableObject {
         applyLock(slot: slot)
     }
 
+    /// 设置面板用：按给定状态锁定/解锁该路 AE/AF
+    func setLock(_ locked: Bool, slot: CameraSlot) {
+        guard !isRecording, lockState[slot.index] != locked else { return }
+        lockState[slot.index] = locked
+        applyLock(slot: slot)
+    }
+
     private func applyLock(slot: CameraSlot) {
         guard let device = device(for: slot) else { return }
         let locked = lockState[slot.index]
@@ -640,8 +658,12 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// 开始录制：按当前布局/方向/规格启动对应录制器
     func startRecording() {
-        guard !isRecording, session.isRunning, isMultiCamSupported,
-              cameraA != nil, cameraB != nil else { return }
+        guard !isRecording, isMultiCamSupported, cameraA != nil, cameraB != nil else { return }
+        // 会话未就绪时明确报错，避免"点了没反应"的错觉（按键必须立即有反馈）
+        guard session.isRunning else {
+            error = .recordingFailed("相机会话未就绪，请稍后重试")
+            return
+        }
         do {
             // 两路连接的方向已在 applyOrientation() 中跟随界面锁定，
             // 录制起点即当前方向；录制期间不再跟随旋转（成片方向固定）。

@@ -16,6 +16,8 @@ final class CameraPairProbe {
     private let lock = NSLock()
 
     /// 判断 a 与 b 两个镜头能否同时加入多摄会话
+    /// fail-open 策略：探测过程任何异常都按"可用"处理并缓存，
+    /// 避免探测误判导致整个选摄列表被置灰、切换镜头按钮"点不动"。
     func canUseTogether(_ a: CameraOption, _ b: CameraOption) -> Bool {
         let key = [a.id, b.id].sorted().joined(separator: "|")
         lock.lock()
@@ -23,25 +25,32 @@ final class CameraPairProbe {
         lock.unlock()
         if let cached { return cached }
 
-        var result = false
-        let inputA = try? AVCaptureDeviceInput(device: a.device)
-        let inputB = try? AVCaptureDeviceInput(device: b.device)
+        do {
+            var result = false
+            let inputA = try AVCaptureDeviceInput(device: a.device)
+            let inputB = try AVCaptureDeviceInput(device: b.device)
 
-        probeSession.beginConfiguration()
-        if let inputA, let inputB,
-           probeSession.canAddInput(inputA),
-           probeSession.canAddInput(inputB) {
-            probeSession.addInput(inputA)
-            // 加入第一路后再探测第二路，最接近真实配置路径
-            result = probeSession.canAddInput(inputB)
-            probeSession.removeInput(inputA)
+            probeSession.beginConfiguration()
+            if probeSession.canAddInput(inputA),
+               probeSession.canAddInput(inputB) {
+                probeSession.addInput(inputA)
+                // 加入第一路后再探测第二路，最接近真实配置路径
+                result = probeSession.canAddInput(inputB)
+                probeSession.removeInput(inputA)
+            }
+            probeSession.commitConfiguration()
+
+            lock.lock()
+            cache[key] = result
+            lock.unlock()
+            return result
+        } catch {
+            // 探测异常（如设备繁忙/输入构造失败）→ 放行，交给运行期兜底
+            lock.lock()
+            cache[key] = true
+            lock.unlock()
+            return true
         }
-        probeSession.commitConfiguration()
-
-        lock.lock()
-        cache[key] = result
-        lock.unlock()
-        return result
     }
 
     /// 某台设备是否支持目标分辨率/帧率档位

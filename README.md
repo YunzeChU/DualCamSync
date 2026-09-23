@@ -42,11 +42,11 @@ DualCamSync/
     │   └── VideoCompositor.swift      #   CI 实时合成器（分屏/PiP）
     ├── Views/                         # SwiftUI 界面（全部液态玻璃）
     │   ├── CameraView.swift           #   主界面 + 横竖屏自适应布局
-    │   ├── ControlBar.swift           #   快门/功能按钮/镜头角标
-    │   ├── CameraPickerPanel.swift    #   选摄面板
+    │   ├── ControlBar.swift           #   快门/功能键/设置键（玻璃按钮）
+    │   ├── FunctionPanel.swift        #   功能面板（镜头/布局/模式/分辨率）
     │   ├── SettingsPanel.swift        #   设置面板
     │   ├── Glass.swift                #   .glassEffect() 统一修饰器
-    │   └── PreviewLayerView.swift     #   预览层包装
+    │   └── PreviewLayerView.swift     #   预览层包装（纯显示，不拦截触摸）
     ├── Support/                       # 系统监控 / 相册保存
     └── Resources/Info.plist           # 权限描述文本等
 ```

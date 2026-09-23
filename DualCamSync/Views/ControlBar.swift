@@ -1,6 +1,15 @@
 import SwiftUI
 
-/// 玻璃圆形图标按钮（布局切换 / 设置入口）
+/// 玻璃按钮按压反馈：手指按下轻微缩小，松手回弹（原生手感）
+struct GlassPressStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .scaleEffect(configuration.isPressed ? 0.9 : 1)
+            .animation(.spring(response: 0.25, dampingFraction: 0.6), value: configuration.isPressed)
+    }
+}
+
+/// 玻璃圆形图标按钮（功能键 / 设置键）
 struct GlassIconButton: View {
     let systemImage: String
     let action: () -> Void
@@ -10,11 +19,12 @@ struct GlassIconButton: View {
             Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .medium))
                 .foregroundStyle(.white)
-                .frame(width: 44, height: 44)
+                .frame(width: 48, height: 48)
                 .glassEffect(.regular)
                 .clipShape(Circle())
         }
-        .buttonStyle(.plain)
+        .buttonStyle(GlassPressStyle())
+        .contentShape(Circle())   // 固定命中形状，点击更灵敏
     }
 }
 
@@ -35,34 +45,9 @@ struct ShutterButton: View {
                            height: isRecording ? 26 : 54)
                     .animation(.spring(duration: 0.3), value: isRecording)
             }
-            .padding(4)
+            .padding(8)                // 扩大命中区域，手指更容易点到
+            .contentShape(Circle())
         }
-        .buttonStyle(.plain)
-    }
-}
-
-/// 镜头角标（液态玻璃胶囊）：显示镜头名称 + AE/AF 锁定开关
-/// 点按角标上的锁图标可锁定/解锁该路对焦与曝光
-struct CameraLabelView: View {
-    let name: String
-    let locked: Bool
-    let onToggleLock: () -> Void
-
-    var body: some View {
-        HStack(spacing: 8) {
-            Button(action: onToggleLock) {
-                Image(systemName: locked ? "lock.fill" : "lock.open")
-                    .font(.system(size: 10, weight: .bold))
-                    .foregroundStyle(locked ? Color.yellow : .white)
-            }
-            .buttonStyle(.plain)
-
-            Text(name)
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(.white)
-        }
-        .padding(.horizontal, 11)
-        .padding(.vertical, 7)
-        .glassCapsule()
+        .buttonStyle(GlassPressStyle())
     }
 }
