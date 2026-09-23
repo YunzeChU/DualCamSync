@@ -45,7 +45,9 @@ final class CameraPairProbe {
             lock.unlock()
             return result
         } catch {
-            // 探测异常（如设备繁忙/输入构造失败）→ 放行，交给运行期兜底
+            // 探测异常（如设备繁忙/输入构造失败）→ 收尾会话配置后放行，
+            // 交给运行期兜底，避免整个选摄列表被置灰、切换镜头按钮点不动。
+            probeSession.commitConfiguration()
             lock.lock()
             cache[key] = true
             lock.unlock()

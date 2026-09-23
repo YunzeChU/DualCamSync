@@ -127,8 +127,8 @@ struct CameraView: View {
                        height: slotBHeight(geo, isLandscape))
                 .offset(x: slotBX(geo, isLandscape), y: slotBY(geo, isLandscape))
                 .clipShape(camera.layout == .pictureInPicture
-                           ? RoundedRectangle(cornerRadius: 18, style: .continuous)
-                           : Rectangle())
+                           ? AnyShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                           : AnyShape(Rectangle()))
         }
     }
 
