@@ -80,6 +80,15 @@ struct SettingsPanel: View {
                     .disabled(camera.isRecording)
                 }
 
+                // 拍摄地点（保存时写入视频元数据，需要定位权限）
+                Toggle("拍摄地点 (写入视频)", isOn: Binding(
+                    get: { camera.includeLocation },
+                    set: { camera.includeLocation = $0 }
+                ))
+                .tint(.yellow)
+                .disabled(camera.isRecording)
+                hint("保存视频时把拍摄地点写入视频元数据；未授权定位则不写入")
+
                 // 曝光补偿
                 sectionTitle("曝光补偿")
                 ForEach(CameraSlot.allCases) { slot in
@@ -105,7 +114,7 @@ struct SettingsPanel: View {
             }
             .padding(18)
         }
-        .frame(width: 330)   // 固定宽度
+        .frame(width: 360)   // 固定宽度（内容与玻璃边缘留足呼吸空间）
         .frame(maxHeight: 560)   // 限高：竖屏贴合 560，横屏受限父级自动 ≤ 屏高
         .glassPanel(cornerRadius: 32)
     }

@@ -1,3 +1,4 @@
+import CoreLocation
 import Foundation
 import Photos
 
@@ -10,6 +11,7 @@ enum PhotoLibrarySaver {
     /// 将多个视频文件保存到系统相册
     /// - Parameters:
     ///   - urls: 本地视频文件路径（录制临时文件）
+    ///   - location: 拍摄地点（写入视频元数据；nil 则不写）
     ///   - completion: (保存成功的 URL 列表, 保存失败的 URL 列表)，主线程回调
     /// 返回"哪些成功/哪些失败"而非仅计数，调用方可据此只删除成功文件、
     /// 保留失败文件供用户手动找回（修复：保存失败后临时文件被误删）。
@@ -18,6 +20,7 @@ enum PhotoLibrarySaver {
     /// 相册"写入"权限（addOnly）延迟到保存时在此申请；
     /// 用户拒绝 → 全部计入失败，由调用方提示并保留临时文件。
     static func saveVideos(at urls: [URL],
+                           location: CLLocation? = nil,
                            completion: @escaping (_ savedURLs: [URL], _ failedURLs: [URL]) -> Void) {
         guard !urls.isEmpty else {
             completion([], [])
@@ -38,8 +41,11 @@ enum PhotoLibrarySaver {
                 for url in urls {
                     group.enter()
                     PHPhotoLibrary.shared().performChanges({
-                        // 仅创建视频资产，不读取相册
-                        PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                        // 仅创建视频资产，不读取相册；可附带拍摄地点元数据
+                        let request = PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
+                        if let request, let location {
+                            request.location = location
+                        }
                     }) { success, _ in
                         counterQueue.sync {
                             if success { savedURLs.append(url) } else { failedURLs.append(url) }

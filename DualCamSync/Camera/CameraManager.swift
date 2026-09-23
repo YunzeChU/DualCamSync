@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreLocation
 import CoreMedia
 import CoreVideo
 import Photos
@@ -56,6 +57,9 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var recordingElapsed: TimeInterval = 0
     @Published var interfaceOrientation: UIInterfaceOrientation = .portrait
 
+    /// 拍摄地点开关（保存视频时把定位写入视频元数据；需要定位权限）
+    @Published var includeLocation = true
+
     /// 各档位在"当前双摄组合"下的可用性（UI 置灰用）
     @Published var presetAvailability: [ResolutionPreset: Bool] = [:]
     @Published var isDolbyVisionAvailable = false
@@ -112,6 +116,19 @@ final class CameraManager: NSObject, ObservableObject {
 
     private let systemMonitor = SystemMonitor()
 
+    // MARK: - 定位（拍摄地点）
+
+    private let locationManager = CLLocationManager()
+    private var lastLocation: CLLocation?
+
+    /// 请求定位权限 + 单次获取位置（权限弹窗与应用启动同批出现，避免录制中打扰）
+    private func requestLocationPermission() {
+        locationManager.delegate = self
+        // 拍摄地点不需要高精度，百米级即可，省电且无需高精度权限
+        locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+        locationManager.requestWhenInUseAuthorization()
+    }
+
     // MARK: - 初始化
 
     override init() {
@@ -133,6 +150,7 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
 
+        requestLocationPermission()   // 定位权限与相机/麦克风权限同一批请求
         discoverCameras()
         if cameraA == nil || cameraB == nil { pickDefaultCameras() }
 
@@ -169,6 +187,11 @@ final class CameraManager: NSObject, ObservableObject {
         // 按 uniqueID 去重
         var seen = Set<String>()
         list = list.filter { seen.insert($0.id).inserted }
+        // 前置去重：iPhone 前置相机常被系统以多个虚拟设备暴露
+        // （TrueDepth 与 WideAngle 可能指向同一颗物理前置），导致
+        // 列表出现多个同名"前置"；同一"位置+镜头类型"只保留一个。
+        var seenLens = Set<String>()
+        list = list.filter { seenLens.insert("\($0.position.rawValue)|\($0.lensType.rawValue)").inserted }
         // 排序：后置优先，镜头顺序 超广角->广角->长焦->前置
         let lensOrder: [LensType: Int] = [.ultraWide: 0, .wide: 1, .telephoto: 2, .front: 3]
         list.sort {
@@ -258,11 +281,19 @@ final class CameraManager: NSObject, ObservableObject {
             // 防抖 / 方向 / 杜比
             applyStabilization()
             applyOrientation()
-            refreshDolbyCapability()
 
             session.commitConfiguration()
             session.startRunning()
             refreshCapabilities()
+            // 杜比能力探测放在 commit + startRunning 之后：
+            // 输出未完全就绪时 availableVideoCodecTypes 可能为空数组，
+            // 过早探测会把支持杜比视界的设备误判为不可用（开关一直灰）。
+            refreshDolbyCapability()
+
+            // 预览连接建立失败不能静默：双摄预览只有一路，用户无法发现。
+            if previewConnA == nil || previewConnB == nil {
+                error = .configurationFailed("预览层连接建立失败，请尝试重新选择镜头组合")
+            }
         } catch {
             session.commitConfiguration()
             self.error = (error as? CameraError) ?? .configurationFailed(error.localizedDescription)
@@ -295,6 +326,8 @@ final class CameraManager: NSObject, ObservableObject {
         guard let port = input.ports.first(where: { $0.mediaType == .video }) else { return nil }
         let conn = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
         guard session.canAddConnection(conn) else { return nil }
+        // 显式启用连接：确保预览层真正参与渲染（防御"只有一路画面"）
+        conn.isEnabled = true
         // 前置不镜像（需求：前置摄像头不允许镜像）
         conn.automaticallyAdjustsVideoMirroring = false
         conn.isVideoMirrored = false
@@ -499,8 +532,12 @@ final class CameraManager: NSObject, ObservableObject {
     private static let dolbyVisionCodec = AVVideoCodecType(rawValue: "dvhe")
 
     /// 杜比视界能力探测 + 应用（仅双文件模式；合成路径不支持）
-    /// 修复：能力不可用时同步关闭 dolbyVisionEnabled 开关，避免 UI 出现
-    /// "开关开着但实际没开"的状态不一致。
+    /// -------------------------------------------------------------
+    /// 修复"杜比视界一直灰、开不了"：
+    ///  1. 探测时机移到 commit + startRunning 之后（availableVideoCodecTypes
+    ///     在输出未就绪时为空数组，过早探测误判为不可用）；
+    ///  2. 双重判据：输出支持 dvhe 编码器（列表为空时视为"查询未就绪"不判死）
+    ///     + 两台设备都具备 10-bit HDR 采集格式（HDR 内容由 10-bit 承载）。
     private func refreshDolbyCapability() {
         guard mode == .dualFiles, let outA = movieOutputA else {
             let wasAvailable = isDolbyVisionAvailable
@@ -511,12 +548,35 @@ final class CameraManager: NSObject, ObservableObject {
             }
             return
         }
-        isDolbyVisionAvailable = outA.availableVideoCodecTypes.contains { $0.rawValue == "dvhe" }
+        // 1) 输出编码器支持 dvhe（iPhone 上 MovieFileOutput 应列出；
+        //    查询过早列表为空 → 不据此判死，交给设备格式判据兜底）
+        let codecOK: Bool
+        if outA.availableVideoCodecTypes.isEmpty {
+            codecOK = true
+        } else {
+            codecOK = outA.availableVideoCodecTypes.contains { $0.rawValue == "dvhe" }
+        }
+        // 2) 两路设备都具备 10-bit HDR 采集格式
+        let deviceOK = [cameraA?.device, cameraB?.device]
+            .compactMap { $0 }
+            .allSatisfy(deviceSupportsHDRCapture)
+
+        isDolbyVisionAvailable = codecOK && deviceOK
         if dolbyVisionEnabled && !isDolbyVisionAvailable {
             dolbyVisionEnabled = false
             showDegradationBanner("杜比视界当前不可用，已自动关闭")
         }
         applyDolbySetting()
+    }
+
+    /// 设备是否有 10-bit HDR 采集格式（杜比视界内容由 10-bit 双平面格式承载）
+    private func deviceSupportsHDRCapture(_ device: AVCaptureDevice) -> Bool {
+        let targetVideoRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        let targetFullRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+        return device.formats.contains { format in
+            let subtype = UInt32(CMFormatDescriptionGetMediaSubType(format.formatDescription))
+            return subtype == targetVideoRange || subtype == targetFullRange
+        }
     }
 
     /// 杜比视界/普通 HEVC 输出设置 + HDR 采集管线开关
@@ -666,17 +726,36 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: - 曝光（每路独立）
 
     /// 手动曝光补偿（每路独立）
+    /// -------------------------------------------------------------
+    /// 修复"调整曝光补偿直接闪退"：
+    ///  1. Swift 标准库 min/max 遇到 NaN 会触发 precondition failure 崩溃，
+    ///     设备未就绪时 min/maxExposureTargetBias 可能返回 NaN——改为
+    ///     手动 if 比较（对 NaN 安全）+ 有限性校验，绝不再直接 min/max；
+    ///  2. setExposureTargetBias 属于设备配置类调用：加 lockForConfiguration
+    ///     包裹，避免部分机型/系统在未锁定状态下调用触发异常。
     func setExposureBias(_ value: Float, slot: CameraSlot) {
         guard let device = device(for: slot) else { return }
-        let clamped = min(max(value, device.minExposureTargetBias), device.maxExposureTargetBias)
+        var clamped = value
+        if !clamped.isFinite { clamped = 0 }
+        let lo = device.minExposureTargetBias
+        let hi = device.maxExposureTargetBias
+        if lo.isFinite && hi.isFinite && lo <= hi {
+            if clamped < lo { clamped = lo }
+            if clamped > hi { clamped = hi }
+        }
+        try? device.lockForConfiguration()
         device.setExposureTargetBias(clamped, completionHandler: nil)
+        device.unlockForConfiguration()
         exposureBias[slot.index] = clamped
     }
 
-    /// 该路曝光补偿可调范围
+    /// 该路曝光补偿可调范围（守卫：无效范围一律回退默认，避免 Slider 构造崩溃）
     func exposureBiasRange(for slot: CameraSlot) -> ClosedRange<Float> {
         guard let device = device(for: slot) else { return -2...2 }
-        return device.minExposureTargetBias...device.maxExposureTargetBias
+        let lo = device.minExposureTargetBias
+        let hi = device.maxExposureTargetBias
+        guard lo.isFinite, hi.isFinite, lo <= hi else { return -2...2 }
+        return lo...hi
     }
 
     func device(for slot: CameraSlot) -> AVCaptureDevice? {
@@ -728,6 +807,10 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
         do {
+            // 录制前强制把两路录制连接的方向与当前界面方向对齐
+            // （applyOrientation 在未录制时会同步 activeVideoConnA/B），
+            // 保证 A/B 两路成片朝向一致、与预览一致（修复朝向不一致）。
+            applyOrientation()
             // 两路连接的方向已在 applyOrientation() 中跟随界面锁定，
             // 录制起点即当前方向；录制期间不再跟随旋转（成片方向固定）。
             switch mode {
@@ -778,7 +861,8 @@ final class CameraManager: NSObject, ObservableObject {
         isRecording = false
         applyPendingDowngrade()   // 内存告警等触发的"录制结束后降级"在此闭环
         guard !urls.isEmpty else { return }
-        PhotoLibrarySaver.saveVideos(at: urls) { [weak self] savedURLs, failedURLs in
+        PhotoLibrarySaver.saveVideos(at: urls,
+                                     location: includeLocation ? lastLocation : nil) { [weak self] savedURLs, failedURLs in
             guard let self else { return }
             if failedURLs.isEmpty {
                 self.showDegradationBanner("已保存 \(savedURLs.count) 段视频到相册")
@@ -809,7 +893,8 @@ final class CameraManager: NSObject, ObservableObject {
         applyPendingDowngrade()
         // 模式B一路失败、另一路成功：成功文件仍保存到相册（不丢弃）
         if !successURLs.isEmpty {
-            PhotoLibrarySaver.saveVideos(at: successURLs) { [weak self] savedURLs, savedFailed in
+            PhotoLibrarySaver.saveVideos(at: successURLs,
+                                         location: includeLocation ? lastLocation : nil) { [weak self] savedURLs, savedFailed in
                 guard let self else { return }
                 if savedFailed.isEmpty {
                     self.showDegradationBanner("一路录制失败；成功的一段已保存到相册")
@@ -939,5 +1024,27 @@ final class CameraManager: NSObject, ObservableObject {
         for token in observationTokens {
             NotificationCenter.default.removeObserver(token)
         }
+    }
+}
+
+// MARK: - 定位（拍摄地点写入视频元数据）
+
+extension CameraManager: CLLocationManagerDelegate {
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        switch manager.authorizationStatus {
+        case .authorizedWhenInUse, .authorizedAlways:
+            // 授权后单次获取一个位置即可（拍摄地点不需要持续跟踪）
+            manager.requestLocation()
+        default:
+            break
+        }
+    }
+
+    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        lastLocation = locations.last
+    }
+
+    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        // 定位失败不阻塞录制与保存：视频正常保存，只是不带拍摄地点
     }
 }

@@ -2,8 +2,9 @@ import AVFoundation
 import Foundation
 
 /// 录制分辨率/帧率档位（全局统一，两路摄像头同规格）
+/// 注：4K60 档已移除——AVCaptureMultiCamSession 双路同时 4K60 会超出
+/// 多摄会话带宽限制（Apple 官方能力矩阵不支持），实测不可用。
 enum ResolutionPreset: String, CaseIterable, Identifiable {
-    case uhd60 = "4K60"
     case uhd30 = "4K30"
     case hd60  = "1080P60"
     case hd30  = "1080P30"
@@ -14,7 +15,6 @@ enum ResolutionPreset: String, CaseIterable, Identifiable {
     /// 目标帧率
     var fps: Int {
         switch self {
-        case .uhd60: return 60
         case .uhd30: return 30
         case .hd60:  return 60
         case .hd30:  return 30
@@ -24,8 +24,8 @@ enum ResolutionPreset: String, CaseIterable, Identifiable {
     /// 横屏（自然方向）下的基础分辨率，宽×高
     var landscapeDimensions: (width: Int32, height: Int32) {
         switch self {
-        case .uhd60, .uhd30: return (3840, 2160)
-        case .hd60,  .hd30:  return (1920, 1080)
+        case .uhd30: return (3840, 2160)
+        case .hd60, .hd30: return (1920, 1080)
         }
     }
 }

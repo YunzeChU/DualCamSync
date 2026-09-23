@@ -153,6 +153,11 @@ struct CameraView: View {
                 .clipShape(camera.layout == .pictureInPicture
                            ? AnyShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                            : AnyShape(Rectangle()))
+                // 画中画窗口：圆角 + 极浅阴影，把两个画面区分开
+                // （用户要求"非常非常非常浅"：低不透明度 + 小半径 + 短偏移；
+                //  分屏布局下两路各占半屏，不需要阴影，直接透明）
+                .shadow(color: .black.opacity(camera.layout == .pictureInPicture ? 0.25 : 0),
+                        radius: 9, x: 0, y: 3)
         }
     }
 
@@ -249,21 +254,24 @@ struct CameraView: View {
         }
     }
 
-    /// 录制中的红色计时（液态玻璃胶囊，仿原生相机；不拦截触摸）
+    /// 录制中的红色计时（原生相机风格：红底胶囊 + 白色数字）
+    /// 恢复第一版"红色方框显示录制时间"的观感；不用 glassEffect——
+    /// 玻璃材质在黑背景上可能渲染成半透明看不清，红底白字最直观。
     private var recordingTimerView: some View {
-        HStack(spacing: 6) {
+        HStack(spacing: 5) {
             if camera.isRecording {
                 Circle()
-                    .fill(.red)
-                    .frame(width: 8, height: 8)
+                    .fill(.white)
+                    .frame(width: 7, height: 7)
                 Text(timeString(camera.recordingElapsed))
                     .font(.system(size: 15, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.red)
+                    .foregroundStyle(.white)
+                    .monospacedDigit()
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .glassCapsule()
+        .padding(.vertical, 6)
+        .background(Color.red, in: Capsule())
         .opacity(camera.isRecording ? 1 : 0)
         .allowsHitTesting(false)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
