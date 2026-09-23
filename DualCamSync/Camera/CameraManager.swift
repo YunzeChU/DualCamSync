@@ -270,11 +270,16 @@ final class CameraManager: NSObject, ObservableObject {
             try applyFormat(device: camA.device, preset: preset)
             try applyFormat(device: camB.device, preset: preset)
 
-            // 预览层连接（手动建连）：每次配置用全新预览层实例，
-            // 避免旧连接残留导致 canAddConnection 失败（一路黑屏的根因）
-            previewLayerA = Self.makePreviewLayer(session: session)
-            previewLayerB = Self.makePreviewLayer(session: session)
-            previewGeneration += 1
+            // 预览层连接（手动建连）
+            // 首启直接用 init 里创建的预览层；仅在后续重配（存在旧连接残留风险）时
+            // 重建全新实例并递增 previewGeneration，触发 SwiftUI 换层。
+            // 多摄经典坑：teardown 移除连接后，旧 previewLayer.connection 引用
+            // 未清干净，下一次 canAddConnection 可能失败 → 一路黑屏。
+            if previewGeneration > 0 {
+                previewLayerA = Self.makePreviewLayer(session: session)
+                previewLayerB = Self.makePreviewLayer(session: session)
+                previewGeneration += 1
+            }
             previewConnA = makePreviewConnection(layer: previewLayerA, input: inputA)
             previewConnB = makePreviewConnection(layer: previewLayerB, input: inputB)
 
@@ -289,25 +294,25 @@ final class CameraManager: NSObject, ObservableObject {
                 attachCompositeOutputs(videoInputA: inputA, videoInputB: inputB)
             }
 
-            // 防抖 / 方向 / 杜比
+            // 防抖 / 方向 / 杜比（输出编码器必须在 commit 前设置）
             applyStabilization()
             applyOrientation()
+            refreshDolbyCapability()
 
             session.commitConfiguration()
             session.startRunning()
             refreshCapabilities()
-            // 杜比能力探测放在 commit + startRunning 之后：
-            // 输出未完全就绪时 availableVideoCodecTypes 可能为空数组，
-            // 过早探测会把支持杜比视界的设备误判为不可用（开关一直灰）。
-            refreshDolbyCapability()
+            // commit + startRunning 之后：杜比开启时切 10-bit HDR 采集格式
+            applyHDRFormatIfNeeded()
 
             // 预览连接建立失败不能静默：双摄预览只有一路，用户无法发现。
-            // 细化到 A/B 哪一路失败，便于定位。
+            // 细化到 A/B 哪一路失败、失败原因，便于定位。
             let aOK = previewConnA != nil
             let bOK = previewConnB != nil
             if !aOK || !bOK {
                 error = .configurationFailed(
-                    "预览层建立失败（A 路\(aOK ? "正常" : "失败")、B 路\(bOK ? "正常" : "失败")），请尝试重新选择镜头组合")
+                    "预览层建立失败（A 路\(Self.describeFailure(previewConnA, lastFailure: lastPreviewFailureA))、"
+                    + "B 路\(Self.describeFailure(previewConnB, lastFailure: lastPreviewFailureB))）")
             }
         } catch {
             session.commitConfiguration()
@@ -336,18 +341,37 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     /// 手动创建预览层连接（多摄会话禁止自动建连）
+    /// 失败时记录具体原因（lastPreviewFailure*），错误提示区分
+    /// "端口缺失"与"会话拒绝建连"两种情形，便于真机定位。
     private func makePreviewConnection(layer: AVCaptureVideoPreviewLayer,
                                        input: AVCaptureDeviceInput) -> AVCaptureConnection? {
-        guard let port = input.ports.first(where: { $0.mediaType == .video }) else { return nil }
+        // 防御：若 layer 已存在连接（某些系统版本在 addInput 时可能
+        // 自动为关联的预览层建连），直接复用，避免手动建连失败。
+        if let existing = layer.connection {
+            return existing
+        }
+        guard let port = input.ports.first(where: { $0.mediaType == .video }) else {
+            if layer === previewLayerA { lastPreviewFailureA = "端口缺失" } else { lastPreviewFailureB = "端口缺失" }
+            return nil
+        }
         let conn = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
-        guard session.canAddConnection(conn) else { return nil }
-        // 显式启用连接：确保预览层真正参与渲染（防御"只有一路画面"）
-        conn.isEnabled = true
+        guard session.canAddConnection(conn) else {
+            if layer === previewLayerA { lastPreviewFailureA = "会话拒绝建连" } else { lastPreviewFailureB = "会话拒绝建连" }
+            return nil
+        }
         // 前置不镜像（需求：前置摄像头不允许镜像）
         conn.automaticallyAdjustsVideoMirroring = false
         conn.isVideoMirrored = false
         session.addConnection(conn)
+        if layer === previewLayerA { lastPreviewFailureA = nil } else { lastPreviewFailureB = nil }
         return conn
+    }
+
+    private var lastPreviewFailureA: String?
+    private var lastPreviewFailureB: String?
+
+    private static func describeFailure(_ conn: AVCaptureConnection?, lastFailure: String?) -> String {
+        conn != nil ? "正常" : (lastFailure ?? "未知原因")
     }
 
     /// 逐设备配置分辨率/帧率
@@ -362,7 +386,10 @@ final class CameraManager: NSObject, ObservableObject {
         }) else {
             throw CameraError.presetUnsupported(preset)
         }
-        try device.lockForConfiguration()
+        // 设备配置类调用必须 lock；lock 失败绝不能继续（未锁定设备 unlock 会抛 NSException）
+        guard device.lockForConfiguration() else {
+            throw CameraError.configurationFailed("设备配置锁获取失败（\(device.localizedName)）")
+        }
         device.activeFormat = format
         let duration = CMTime(value: 1, timescale: CMTimeScale(preset.fps))
         device.activeVideoMinFrameDuration = duration
@@ -521,37 +548,54 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     private func applyOrientation() {
-        let angle = Self.rotationAngle(for: interfaceOrientation)
-        previewConnA?.videoRotationAngle = angle
-        previewConnB?.videoRotationAngle = angle
+        // 前后置分别用各自的旋转基准（前置传感器竖装，基准与后置不同）
+        previewConnA?.videoRotationAngle = Self.rotationAngle(
+            for: interfaceOrientation, isFront: Self.isFrontConnection(previewConnA))
+        previewConnB?.videoRotationAngle = Self.rotationAngle(
+            for: interfaceOrientation, isFront: Self.isFrontConnection(previewConnB))
         // 录制连接（未在录制时更新；录制起点方向在 startRecording 里锁定）
         if !isRecording {
-            activeVideoConnA?.videoRotationAngle = angle
-            activeVideoConnB?.videoRotationAngle = angle
+            activeVideoConnA?.videoRotationAngle = Self.rotationAngle(
+                for: interfaceOrientation, isFront: Self.isFrontConnection(activeVideoConnA))
+            activeVideoConnB?.videoRotationAngle = Self.rotationAngle(
+                for: interfaceOrientation, isFront: Self.isFrontConnection(activeVideoConnB))
         }
     }
 
-    /// 竖屏=90°，横屏按左右映射（与 Apple AVCam 官方样例一致）
-    static func rotationAngle(for orientation: UIInterfaceOrientation) -> CGFloat {
+    /// 旋转角度映射。
+    /// 注意：**前后置传感器安装方向不同**——后置横装（landscape）、**前置竖装（portrait）**。
+    /// 同一界面方向下，前置连接必须用"后置角度 -90°"（等价 +270°），
+    /// 否则竖拍时后置成片竖、前置成片横（用户实测：修复前竖拍前置一直是横的）。
+    static func rotationAngle(for orientation: UIInterfaceOrientation, isFront: Bool = false) -> CGFloat {
+        let back: CGFloat
         switch orientation {
-        case .portrait:              return 90
-        case .portraitUpsideDown:    return 270
-        case .landscapeLeft:         return 0
-        case .landscapeRight:        return 180
-        default:                     return 90
+        case .portrait:              back = 90
+        case .portraitUpsideDown:    back = 270
+        case .landscapeLeft:         back = 0
+        case .landscapeRight:        back = 180
+        default:                     back = 90
         }
+        // 前置：传感器竖装，旋转基准与后置相差 -90°（mod 360）
+        return isFront ? (back + 270).truncatingRemainder(dividingBy: 360) : back
+    }
+
+    /// 判断某条连接是否来自前置摄像头（用于选择旋转基准）
+    private static func isFrontConnection(_ conn: AVCaptureConnection?) -> Bool {
+        conn?.inputPorts.first?.sourceDevicePosition == .front
     }
 
     /// 杜比视界 HEVC 码型
     /// iOS 26 SDK 未暴露 AVVideoCodecType 静态成员，用 rawValue("dvhe") 构造（等价常量）
     private static let dolbyVisionCodec = AVVideoCodecType(rawValue: "dvhe")
 
-    /// 杜比视界能力探测 + 应用（仅双文件模式；合成路径不支持）
-    /// -------------------------------------------------------------
+    /// 杜比视界能力探测 + 输出编码器设置（**必须在 commitConfiguration 之前调用**）
+    /// -----------------------------------------------------------------------
     /// 判据只有一条：两路设备都具备 10-bit HDR 采集格式。
     /// 注意：**不能**依赖 MovieFileOutput.availableVideoCodecTypes——
     /// 该列表在设备 activeFormat 还是 8-bit 时不含 dvhe，
     /// 会把支持杜比视界的设备（iPhone 17 Pro）误判为"不支持"导致开关永远灰。
+    /// 另外 setOutputSettings 必须发生在会话配置阶段（commit 前），
+    /// 运行中调用可能触发异常导致闪退——这就是"杜比点开后卡顿闪退"的根因之一。
     private func refreshDolbyCapability() {
         guard mode == .dualFiles, cameraA != nil, cameraB != nil else {
             let wasAvailable = isDolbyVisionAvailable
@@ -560,6 +604,7 @@ final class CameraManager: NSObject, ObservableObject {
                 dolbyVisionEnabled = false
                 if wasAvailable { showDegradationBanner("杜比视界当前不可用，已自动关闭") }
             }
+            applyOutputCodec(useDolby: false)
             return
         }
         let deviceOK = [cameraA?.device, cameraB?.device]
@@ -571,7 +616,7 @@ final class CameraManager: NSObject, ObservableObject {
             dolbyVisionEnabled = false
             showDegradationBanner("杜比视界当前不可用，已自动关闭")
         }
-        applyDolbySetting()
+        applyOutputCodec(useDolby: dolbyVisionEnabled && isDolbyVisionAvailable)
     }
 
     /// 设备是否有 10-bit HDR 采集格式（杜比视界内容由 10-bit 双平面格式承载）
@@ -584,21 +629,9 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// 杜比视界/普通 HEVC 输出设置 + HDR 采集管线开关
-    /// -------------------------------------------------------------
-    /// HDR（杜比视界）录制要真正生效，除了把编码器切到 dvhe，
-    /// 还必须让"采集 → 预览 → 录制"整条链路的视频 HDR 管线开启
-    /// （AVCaptureConnection.isVideoHDREnabled），否则文件虽然带
-    /// dvhe 容器、内容仍是 SDR，观感上不是 HDR。
-    private func applyDolbySetting() {
-        let useDolby = dolbyVisionEnabled && isDolbyVisionAvailable
-        // 注意：iOS 26 SDK 已移除 AVCaptureConnection.isVideoHDREnabled
-        // （iOS 7 时代旧 API）。杜比视界 HDR 生效的正确路径：
-        //   1) activeFormat 切换为同分辨率/帧率的 10-bit HDR 格式（applyHDRFormat）
-        //   2) MovieFileOutput 输出编码器设为 dvhe（下方已有）
-        if useDolby {
-            applyHDRFormat()
-        }
+    /// 设置 MovieFileOutput 输出编码器（hevc / dvhe）。
+    /// 只允许在会话配置阶段（commitConfiguration 之前）调用。
+    private func applyOutputCodec(useDolby: Bool) {
         guard mode == .dualFiles, let outA = movieOutputA, let outB = movieOutputB else { return }
         let codec: AVVideoCodecType = useDolby ? Self.dolbyVisionCodec : .hevc
         for out in [outA, outB] {
@@ -611,13 +644,21 @@ final class CameraManager: NSObject, ObservableObject {
     /// 杜比视界开启时：把两台设备 activeFormat 切到同档 10-bit HDR 格式。
     /// DV 的 HDR 内容由 10-bit 采集格式承载（编码器 dvhe 只是容器）——
     /// 若格式仍是 8-bit，成片即使带 dvhe 容器观感也是 SDR。
-    private func applyHDRFormat() {
+    /// 在 commit + startRunning 之后调用（activeFormat 变更不影响会话结构）。
+    /// 注意：lockForConfiguration 返回 false 时**绝不能**调用 unlock——
+    /// 未锁定的设备 unlock 会抛 NSException 直接闪退（杜比闪退根因之二）。
+    private func applyHDRFormatIfNeeded() {
+        guard dolbyVisionEnabled && isDolbyVisionAvailable else { return }
         for device in [cameraA?.device, cameraB?.device].compactMap({ $0 }) {
             let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
             guard let hdr = findHDRFormat(for: device, width: dims.width, height: dims.height),
                   hdr != device.activeFormat else { continue }
-            try? device.lockForConfiguration()
+            guard device.lockForConfiguration() else { continue }
             device.activeFormat = hdr
+            // 切换 activeFormat 可能重置帧率，重新锁定到当前档位
+            let duration = CMTime(value: 1, timescale: CMTimeScale(preset.fps))
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
             device.unlockForConfiguration()
         }
     }
@@ -748,7 +789,8 @@ final class CameraManager: NSObject, ObservableObject {
             if clamped < lo { clamped = lo }
             if clamped > hi { clamped = hi }
         }
-        try? device.lockForConfiguration()
+        // lock 失败直接返回（绝不能对未锁定设备调用 unlock——NSException 闪退）
+        guard device.lockForConfiguration() else { return }
         device.setExposureTargetBias(clamped, completionHandler: nil)
         device.unlockForConfiguration()
         exposureBias[slot.index] = clamped
@@ -785,7 +827,8 @@ final class CameraManager: NSObject, ObservableObject {
 
     private func applyLock(slot: CameraSlot) {
         guard let device = device(for: slot) else { return }
-        try? device.lockForConfiguration()
+        // lock 失败直接返回（未锁定设备 unlock 会抛 NSException 闪退）
+        guard device.lockForConfiguration() else { return }
         // 对焦：锁定/连续自动对焦
         if focusLockState[slot.index] {
             if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
@@ -856,14 +899,13 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// 录制前把两路 MovieFileOutput 的全部启用视频连接方向对齐到当前界面方向。
     /// 逐个遍历设置（不依赖 videoConnection(of:) 只取第一个连接），
-    /// 从根上保证 A/B 成片朝向一致。
+    /// 前后置分别用各自旋转基准——从根上保证 A/B 成片朝向一致。
     private func lockOutputOrientations() {
-        let angle = Self.rotationAngle(for: interfaceOrientation)
         for out in [movieOutputA, movieOutputB].compactMap({ $0 }) {
             for conn in out.connections where conn.isEnabled {
-                if conn.inputPorts.first?.mediaType == .video {
-                    conn.videoRotationAngle = angle
-                }
+                guard conn.inputPorts.first?.mediaType == .video else { continue }
+                conn.videoRotationAngle = Self.rotationAngle(
+                    for: interfaceOrientation, isFront: Self.isFrontConnection(conn))
             }
         }
     }

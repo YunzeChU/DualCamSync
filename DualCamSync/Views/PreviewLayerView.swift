@@ -43,6 +43,12 @@ final class PreviewContainerView: UIView {
         didSet {
             guard let previewLayer else { return }
             previewLayer.videoGravity = .resizeAspectFill
+            // 换层（CameraManager 每次会话重配都重建预览层，previewGeneration
+            // 触发 SwiftUI 更新后走到这里）时先摘掉旧层——同一容器只挂当前预览层，
+            // 避免旧层残留导致画面错乱/黑屏。
+            if let old = oldValue, old !== previewLayer, old.superlayer === layer {
+                old.removeFromSuperlayer()
+            }
             if previewLayer.superlayer !== layer {
                 layer.addSublayer(previewLayer)
             }

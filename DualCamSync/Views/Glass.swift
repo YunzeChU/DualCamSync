@@ -10,17 +10,14 @@ import SwiftUI
 extension View {
 
     /// 圆角玻璃面板（设置面板 / 选摄面板）
-    /// 注意：iOS 26 液态玻璃的默认背景形状是"胶囊"（Capsule），
-    /// 直接 .glassEffect 后内容越多越接近椭圆/药丸。要变成圆角矩形，
-    /// 必须用 .containerShape 指定形状（环境值从外层传给内层 glassEffect，
-    /// 因此 containerShape 需放在 glassEffect 之后；为兼容各版本渲染路径，
-    /// 前后各放一份 + clipShape 兜底裁切，三者叠加必出圆角矩形）。
+    /// iOS 26 液态玻璃：玻璃背景形状由 `glassEffect(_:in:)` 的 `in:` 参数决定，
+    /// **默认是 Capsule（胶囊）**——内容越多越像药丸/椭圆，选项会超出玻璃背景。
+    /// 前两轮用 `.containerShape()` 想改形状是无效的：containerShape 只影响
+    /// 环境的容器形状（contentShape 等），**改不了 glassEffect 的玻璃背景**，
+    /// 这就是面板始终是药丸的根因。正确做法：直接把玻璃形状指定为圆角矩形。
     func glassPanel(cornerRadius: CGFloat = 28) -> some View {
         self
-            .containerShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .glassEffect(.regular)
-            .containerShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 
     /// 玻璃胶囊（镜头角标 / 状态条）

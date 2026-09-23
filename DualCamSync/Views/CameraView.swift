@@ -35,7 +35,7 @@ struct CameraView: View {
                 controlOverlay(isLandscape: isLandscape)
 
                 // 录制中红色计时（顶部居中）
-                recordingTimerView(topInset: geo.safeAreaInsets.top)
+                recordingTimerView()
 
                 // 功能面板（液态玻璃二级菜单，从功能键所在侧弹出：
                 // 竖屏从底部、横屏从右侧，弹簧+缩放+模糊，贴近原生菜单）
@@ -162,12 +162,10 @@ struct CameraView: View {
     }
 
     /// 单路预览：纯显示容器（不拦截触摸、无镜头角标）
-    /// .id(previewGeneration)：每次会话重配（换镜头/分辨率/模式）后预览层
-    /// 实例被 CameraManager 重建，这里强制 SwiftUI 重建容器，把新预览层挂上，
-    /// 避免"旧容器还挂着旧 layer / 新 layer 无处挂载"导致只有一路画面。
+    /// 预览层实例由 CameraManager 持有；重配后新 layer 经 previewGeneration
+    /// 触发更新，PreviewContainerView.didSet 负责摘旧层挂新层（同一容器换层）。
     private func previewSlot(_ slot: CameraSlot) -> some View {
         PreviewLayerView(layer: slot == .a ? camera.previewLayerA : camera.previewLayerB)
-            .id("preview-\(slot.id)-\(camera.previewGeneration)")
     }
 
     // MARK: 预览几何（分屏：A 占一半、B 占另一半；画中画：A 全屏、B 右下角）
@@ -261,8 +259,10 @@ struct CameraView: View {
     /// 录制中的红色计时（原生相机风格：红底圆角矩形 + 白色数字）
     /// 修复两个问题：
     ///  1. 之前玻璃胶囊在黑背景上渲染成半透明看不清 → 改红底不透明；
-    ///  2. 顶部 .padding(14) 会被灵动岛/刘海遮住 → 用 safeAreaInsets 避开安全区。
-    private func recordingTimerView(topInset: CGFloat) -> some View {
+    ///  2. 顶部 .padding(14) 会被灵动岛/刘海遮住 → 用真实窗口安全区偏移。
+    ///     注意不能读 GeometryReader 的 safeAreaInsets：CameraView 外层
+    ///     ignoresSafeArea 后该值恒为 0，必须从 UIWindow 取。
+    private func recordingTimerView() -> some View {
         HStack(spacing: 5) {
             if camera.isRecording {
                 Circle()
@@ -280,7 +280,15 @@ struct CameraView: View {
         .opacity(camera.isRecording ? 1 : 0)
         .allowsHitTesting(false)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-        .padding(.top, max(topInset + 8, 14))
+        .padding(.top, max(Self.topSafeInset() + 8, 14))
+    }
+
+    /// 从窗口读取真实顶部安全区（灵动岛/刘海高度）
+    private static func topSafeInset() -> CGFloat {
+        UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .compactMap { $0.keyWindow }
+            .first?.safeAreaInsets.top ?? 0
     }
 
     /// 降级横幅
