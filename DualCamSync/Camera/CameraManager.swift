@@ -387,7 +387,7 @@ final class CameraManager: NSObject, ObservableObject {
             throw CameraError.presetUnsupported(preset)
         }
         // 设备配置类调用必须 lock；lock 失败绝不能继续（未锁定设备 unlock 会抛 NSException）
-        guard device.lockForConfiguration() else {
+        guard (try? device.lockForConfiguration()) != nil else {
             throw CameraError.configurationFailed("设备配置锁获取失败（\(device.localizedName)）")
         }
         device.activeFormat = format
@@ -653,7 +653,7 @@ final class CameraManager: NSObject, ObservableObject {
             let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
             guard let hdr = findHDRFormat(for: device, width: dims.width, height: dims.height),
                   hdr != device.activeFormat else { continue }
-            guard device.lockForConfiguration() else { continue }
+            guard (try? device.lockForConfiguration()) != nil else { continue }
             device.activeFormat = hdr
             // 切换 activeFormat 可能重置帧率，重新锁定到当前档位
             let duration = CMTime(value: 1, timescale: CMTimeScale(preset.fps))
@@ -790,7 +790,7 @@ final class CameraManager: NSObject, ObservableObject {
             if clamped > hi { clamped = hi }
         }
         // lock 失败直接返回（绝不能对未锁定设备调用 unlock——NSException 闪退）
-        guard device.lockForConfiguration() else { return }
+        guard (try? device.lockForConfiguration()) != nil else { return }
         device.setExposureTargetBias(clamped, completionHandler: nil)
         device.unlockForConfiguration()
         exposureBias[slot.index] = clamped
@@ -828,7 +828,7 @@ final class CameraManager: NSObject, ObservableObject {
     private func applyLock(slot: CameraSlot) {
         guard let device = device(for: slot) else { return }
         // lock 失败直接返回（未锁定设备 unlock 会抛 NSException 闪退）
-        guard device.lockForConfiguration() else { return }
+        guard (try? device.lockForConfiguration()) != nil else { return }
         // 对焦：锁定/连续自动对焦
         if focusLockState[slot.index] {
             if device.isFocusModeSupported(.locked) { device.focusMode = .locked }

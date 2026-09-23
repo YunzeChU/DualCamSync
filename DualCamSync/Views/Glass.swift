@@ -14,10 +14,12 @@ extension View {
     /// **默认是 Capsule（胶囊）**——内容越多越像药丸/椭圆，选项会超出玻璃背景。
     /// 前两轮用 `.containerShape()` 想改形状是无效的：containerShape 只影响
     /// 环境的容器形状（contentShape 等），**改不了 glassEffect 的玻璃背景**，
-    /// 这就是面板始终是药丸的根因。正确做法：直接把玻璃形状指定为圆角矩形。
+    /// 这就是面板始终是药丸的根因。正确做法：直接把玻璃形状指定为圆角矩形，
+    /// 再 clipShape 同步裁剪内容，保证选项与玻璃背景同形状、不越界。
     func glassPanel(cornerRadius: CGFloat = 28) -> some View {
         self
             .glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 
     /// 玻璃胶囊（镜头角标 / 状态条）
