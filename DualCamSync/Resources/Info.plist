@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>DualCamSync</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+
+	<!-- 权限描述文本：相机 / 麦克风 / 相册(仅写入) -->
+	<key>NSCameraUsageDescription</key>
+	<string>DualCamSync 需要使用相机权限，用于双摄像头同时预览与录制。</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>DualCamSync 录制视频时需要麦克风权限，用于同步采集立体声/空间音频。</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>DualCamSync 需要相册写入权限，用于将录制的视频保存到系统相册（不读取相册内容）。</string>
+
+	<!-- 允许 60fps 等高于 30fps 的采集帧率（对 4K60/1080P60 必需） -->
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+
+	<!-- 支持竖屏 + 左右横屏，跟随系统旋转（录制时锁定方向） -->
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+
+	<key>UILaunchScreen</key>
+	<dict/>
+
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+</dict>
+</plist>

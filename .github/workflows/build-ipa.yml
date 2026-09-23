@@ -1,0 +1,62 @@
+# =============================================================
+# DualCamSync - GitHub Actions 云端编译出 IPA
+# -------------------------------------------------------------
+# 流程：push 到 main 或手动触发 -> macOS 26 runner 上用 Xcode 26
+#       编译（未签名）-> 打包 .ipa -> 上传为 Artifact 供下载。
+#
+# 签名说明：
+#   本工程按"未签名 IPA + 爱思助手 Apple ID 签名"流程设计
+#   （CODE_SIGNING_ALLOWED=NO）。
+#   下载 IPA 后：爱思助手连接 iPhone -> 导入 IPA -> 输入 Apple ID
+#   -> 自动签名安装（免费签名 7 天有效，到期用爱思助手重签即可）。
+# =============================================================
+
+name: Build IPA (unsigned)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    # macOS 26 官方 runner，预装 Xcode 26（含 iOS 26 SDK）
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Show toolchain version
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Build unsigned app for device
+        run: |
+          xcodebuild \
+            -project DualCamSync.xcodeproj \
+            -scheme DualCamSync \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R "build/Build/Products/Release-iphoneos/DualCamSync.app" Payload/
+          zip -r DualCamSync.ipa Payload/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DualCamSync-unsigned-ipa
+          path: DualCamSync.ipa
+          if-no-files-found: error

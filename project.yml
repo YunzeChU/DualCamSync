@@ -1,0 +1,49 @@
+# =============================================================
+# DualCamSync - XcodeGen 工程定义文件
+# -------------------------------------------------------------
+# 为什么用 XcodeGen：
+#   手写 .xcodeproj (pbxproj) 极易损坏且难以 review。
+#   本文件是工程的"唯一事实来源"，在本地或 CI 执行
+#   `xcodegen generate` 即可生成可被 Xcode 打开的工程文件。
+#
+# 用法：
+#   brew install xcodegen          # 安装 XcodeGen
+#   xcodegen generate              # 生成 DualCamSync.xcodeproj
+#
+# GitHub Actions 的 build-ipa.yml 已内置上述两步，无需手动执行。
+# =============================================================
+
+name: DualCamSync
+
+options:
+  bundleIdPrefix: com.example        # 如需自定义，改 PRODUCT_BUNDLE_IDENTIFIER 即可
+  deploymentTarget:
+    iOS: "26.0"                      # 硬性约束：最低部署版本 iOS 26（Liquid Glass 必需）
+  createIntermediateGroups: true
+  xcodeVersion: "26.0"
+
+settings:
+  base:
+    # Swift 5 语言模式：AVFoundation 的代理回调在后台线程触发，
+    # 5 模式可避免 Swift 6 严格并发的编译摩擦，便于后续迭代维护。
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "26.0"
+    TARGETED_DEVICE_FAMILY: "1"      # 仅 iPhone（个人真机测试）
+    MARKETING_VERSION: "1.0.0"
+    CURRENT_PROJECT_VERSION: "1"
+    GENERATE_INFOPLIST_FILE: "NO"    # 权限描述等写在仓库内的显式 Info.plist 中
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+
+targets:
+  DualCamSync:
+    type: application
+    platform: iOS
+    sources:
+      - path: DualCamSync
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.DualCamSync
+        PRODUCT_NAME: DualCamSync
+        INFOPLIST_FILE: DualCamSync/Resources/Info.plist
+    scheme:
+      gatherCoverageData: false

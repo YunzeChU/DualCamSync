@@ -1,0 +1,18 @@
+# 构建产物
+build/
+DerivedData/
+*.ipa
+*.xcarchive
+
+# XcodeGen 生成的工程文件（由 project.yml 重新生成）
+*.xcodeproj
+
+# Xcode 用户状态
+xcuserdata/
+*.xcuserstate
+
+# 系统杂项
+.DS_Store
+
+# 本地临时录制文件（运行时生成，不入库）
+tmp_recordings/
