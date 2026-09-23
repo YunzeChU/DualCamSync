@@ -90,14 +90,19 @@ final class CameraManager: NSObject, ObservableObject {
     /// - 双文件模式：MovieFileOutput 上启用中的视频连接
     /// - 合成模式：VideoDataOutput 上启用中的视频连接
     private var activeVideoConnA: AVCaptureConnection? {
-        mode == .dualFiles
-            ? movieOutputA?.connections.first { $0.isEnabled && $0.mediaType == .video }
-            : compositeVideoConnA
+        mode == .dualFiles ? videoConnection(of: movieOutputA) : compositeVideoConnA
     }
     private var activeVideoConnB: AVCaptureConnection? {
-        mode == .dualFiles
-            ? movieOutputB?.connections.first { $0.isEnabled && $0.mediaType == .video }
-            : compositeVideoConnB
+        mode == .dualFiles ? videoConnection(of: movieOutputB) : compositeVideoConnB
+    }
+
+    /// 从任意捕获输出中取出"启用中的视频连接"
+    /// 注意：AVCaptureConnection 没有 mediaType 属性，必须经 inputPorts 判断媒体类型
+    private func videoConnection(of output: AVCaptureOutput?) -> AVCaptureConnection? {
+        guard let output else { return nil }
+        return output.connections.first {
+            $0.isEnabled && ($0.inputPorts.first?.mediaType == .video)
+        }
     }
 
     private let systemMonitor = SystemMonitor()
@@ -276,7 +281,7 @@ final class CameraManager: NSObject, ObservableObject {
     private func makePreviewConnection(layer: AVCaptureVideoPreviewLayer,
                                        input: AVCaptureDeviceInput) -> AVCaptureConnection? {
         guard let port = input.ports.first(where: { $0.mediaType == .video }) else { return nil }
-        let conn = AVCaptureConnection(inputPort: port, layer: layer)
+        let conn = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
         guard session.canAddConnection(conn) else { return nil }
         // 前置不镜像（需求：前置摄像头不允许镜像）
         conn.automaticallyAdjustsVideoMirroring = false
@@ -323,7 +328,7 @@ final class CameraManager: NSObject, ObservableObject {
         // 空间音频仅"双文件模式（MovieFileOutput）"原生支持；
         // 合成模式（AVAssetWriter）v1 只保证立体声，空间音频在 UI 置灰。
         let wantSpatial = spatialAudioEnabled && isSpatialAudioAvailable && mode == .dualFiles
-        let targetMode: AVCaptureDeviceInput.MultichannelAudioMode = wantSpatial ? .firstOrderAmbisonics : .stereo
+        let targetMode: AVCaptureMultichannelAudioMode = wantSpatial ? .firstOrderAmbisonics : .stereo
         if input.isMultichannelAudioModeSupported(targetMode) {
             input.multichannelAudioMode = targetMode
         }
@@ -361,11 +366,11 @@ final class CameraManager: NSObject, ObservableObject {
     private func constrainMovieOutput(_ output: AVCaptureMovieFileOutput, keep: CameraOption?) {
         for conn in output.connections {
             guard let port = conn.inputPorts.first else { continue }
-            if conn.mediaType == .audio {
+            if port.mediaType == .audio {
                 conn.isEnabled = true
                 continue
             }
-            guard conn.mediaType == .video else { continue }
+            guard port.mediaType == .video else { continue }
             let belongs = (keep != nil
                 && port.sourceDevicePosition == keep!.position
                 && port.sourceDeviceType == keep!.device.deviceType)
@@ -375,7 +380,7 @@ final class CameraManager: NSObject, ObservableObject {
             conn.isVideoMirrored = false
             // 默认 HEVC；杜比视界由 refreshDolbyCapability 覆盖
             if belongs {
-                try? output.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: conn)
+                output.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: conn)
             }
         }
     }
@@ -422,7 +427,7 @@ final class CameraManager: NSObject, ObservableObject {
                                      keep: CameraOption?) -> AVCaptureConnection? {
         var kept: AVCaptureConnection?
         for conn in output.connections {
-            guard let port = conn.inputPorts.first, conn.mediaType == .video else { continue }
+            guard let port = conn.inputPorts.first, port.mediaType == .video else { continue }
             let belongs = (keep != nil
                 && port.sourceDevicePosition == keep!.position
                 && port.sourceDeviceType == keep!.device.deviceType)
@@ -477,22 +482,26 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
+    /// 杜比视界 HEVC 码型
+    /// iOS 26 SDK 未暴露 AVVideoCodecType 静态成员，用 rawValue("dvhe") 构造（等价常量）
+    private static let dolbyVisionCodec = AVVideoCodecType(rawValue: "dvhe")
+
     /// 杜比视界能力探测 + 应用（仅双文件模式；合成路径不支持）
     private func refreshDolbyCapability() {
         guard mode == .dualFiles, let outA = movieOutputA else {
             isDolbyVisionAvailable = false
             return
         }
-        isDolbyVisionAvailable = outA.availableVideoCodecTypes.contains(.dolbyVisionHEVC)
+        isDolbyVisionAvailable = outA.availableVideoCodecTypes.contains { $0.rawValue == "dvhe" }
         applyDolbySetting()
     }
 
     private func applyDolbySetting() {
         guard mode == .dualFiles, let outA = movieOutputA, let outB = movieOutputB else { return }
-        let codec: AVVideoCodecType = (dolbyVisionEnabled && isDolbyVisionAvailable) ? .dolbyVisionHEVC : .hevc
+        let codec: AVVideoCodecType = (dolbyVisionEnabled && isDolbyVisionAvailable) ? Self.dolbyVisionCodec : .hevc
         for out in [outA, outB] {
-            for conn in out.connections where conn.isEnabled && conn.mediaType == .video {
-                try? out.setOutputSettings([AVVideoCodecKey: codec], for: conn)
+            for conn in out.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
+                out.setOutputSettings([AVVideoCodecKey: codec], for: conn)
             }
         }
     }
@@ -758,7 +767,8 @@ final class CameraManager: NSObject, ObservableObject {
         // 会话被中断（如来电）→ 停止并保存
         NotificationCenter.default.addObserver(forName: AVCaptureSession.wasInterruptedNotification,
                                                object: nil, queue: .main) { [weak self] note in
-            if let reason = (note.userInfo?[AVCaptureSession.interruptionReasonKey] as? NSNumber)?.intValue,
+            // 通知 userInfo 键名（Objective-C 常量，Swift 未暴露为静态成员，直接用字符串字面量）
+            if let reason = (note.userInfo?["AVCaptureSessionInterruptionReasonKey"] as? NSNumber)?.intValue,
                reason == AVCaptureSession.InterruptionReason.audioDeviceInUseByAnotherClient.rawValue {
                 self?.showDegradationBanner("录音设备被其他应用占用，已停止录制")
             }
@@ -767,7 +777,7 @@ final class CameraManager: NSObject, ObservableObject {
         // 运行期错误 → 停止并提示
         NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification,
                                                object: nil, queue: .main) { [weak self] note in
-            if let err = note.userInfo?[AVCaptureSession.errorKey] as? AVError {
+            if let err = note.userInfo?["AVCaptureSessionErrorKey"] as? AVError {
                 self?.handleRecordingFailed(err)
             }
         }

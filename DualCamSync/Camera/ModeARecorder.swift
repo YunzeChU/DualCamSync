@@ -91,7 +91,7 @@ final class ModeARecorder: NSObject,
     func start(outputSize: (width: Int32, height: Int32),
                layout: PreviewLayout) throws {
         guard !isRecording else { return }
-        guard let manager else {
+        guard manager != nil else {
             throw CameraError.configurationFailed("录制器未就绪")
         }
 
@@ -194,11 +194,22 @@ final class ModeARecorder: NSObject,
         return 8_000_000
     }
 
-    // MARK: - 视频回调
+    // MARK: - 视频/音频回调
 
+    /// 视频与音频回调共用同一入口（两个协议的签名完全一致），按输出类型分流
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
+        if output is AVCaptureVideoDataOutput {
+            handleVideoSampleBuffer(sampleBuffer, connection: connection)
+        } else {
+            handleAudioSampleBuffer(sampleBuffer, connection: connection)
+        }
+    }
+
+    /// 视频回调：两路帧配对后合成一帧写入
+    private func handleVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer,
+                                        connection: AVCaptureConnection) {
         guard isRecording,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -236,12 +247,11 @@ final class ModeARecorder: NSObject,
         adaptor.append(composed, withPresentationTime: frameTime)
     }
 
-    // MARK: - 音频回调
-
-    func captureOutput(_ output: AVCaptureOutput,
-                       didOutput sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        guard isRecording, connection.mediaType == .audio else { return }
+    /// 音频回调：按真实声道数创建 AAC 音轨并写入
+    /// 注意：AVCaptureConnection 没有 mediaType，需经 inputPorts 判断
+    private func handleAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer,
+                                        connection: AVCaptureConnection) {
+        guard isRecording, connection.inputPorts.first?.mediaType == .audio else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
         // 首次收到音频时，按真实声道数/采样率创建音频输入（立体声优先）
@@ -277,7 +287,7 @@ final class ModeARecorder: NSObject,
                                                   sampleBuffer: sampleBuffer,
                                                   sampleTimingEntryCount: 1,
                                                   sampleTimingArray: &timing,
-                                                  newSampleBufferOut: &copied)
+                                                  sampleBufferOut: &copied)
         }
         let buffer = copied ?? sampleBuffer
         guard let audioWriterInput, audioWriterInput.isReadyForMoreMediaData else { return }
