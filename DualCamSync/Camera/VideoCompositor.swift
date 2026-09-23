@@ -86,17 +86,24 @@ final class VideoCompositor {
     }
 
     /// 将图片 aspect-fill 铺满目标矩形（缩放 + 居中裁剪）
+    /// 修复：原先 cropRect 从 scaled 原点 (0,0) 开始裁，源画面宽高比
+    /// 与目标不同时裁到左/下侧（不居中）。正确做法：超出目标尺寸的轴
+    /// **两侧各裁一半**（居中），即先把 scaled 平移到目标矩形左上角对齐
+    /// 后再"多退少补"，再裁到目标矩形。
     private func aspectFill(_ image: CIImage, into rect: CGRect) -> CIImage {
         guard image.extent.width > 0, image.extent.height > 0 else { return image }
         let scale = max(rect.width / image.extent.width,
                         rect.height / image.extent.height)
         let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        let cropRect = CGRect(x: rect.midX - rect.width / 2,
-                              y: rect.midY - rect.height / 2,
-                              width: rect.width,
-                              height: rect.height)
+        let sw = image.extent.width * scale
+        let sh = image.extent.height * scale
+        // 居中：超出目标尺寸的轴，两侧各裁一半（offset 为负表示往回收）
+        let offsetX = rect.minX - (sw - rect.width) / 2
+        let offsetY = rect.minY - (sh - rect.height) / 2
+        let cropRect = CGRect(x: rect.minX, y: rect.minY,
+                              width: rect.width, height: rect.height)
         return scaled
-            .transformed(by: CGAffineTransform(translationX: cropRect.minX, y: cropRect.minY))
+            .transformed(by: CGAffineTransform(translationX: offsetX, y: offsetY))
             .cropped(to: cropRect)
     }
 

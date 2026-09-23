@@ -368,8 +368,8 @@ final class CameraManager: NSObject, ObservableObject {
         modeBRecorder.onFinished = { [weak self] urls in
             self?.handleRecordingFinished(urls: urls)
         }
-        modeBRecorder.onError = { [weak self] err, successURLs in
-            self?.handleRecordingFailed(err, successURLs: successURLs)
+        modeBRecorder.onError = { [weak self] err, successURLs, failedURLs in
+            self?.handleRecordingFailed(err, successURLs: successURLs, failedURLs: failedURLs)
         }
     }
 
@@ -725,15 +725,14 @@ final class CameraManager: NSObject, ObservableObject {
         return isPortrait ? (base.height, base.width) : base
     }
 
-    /// 麦克风音频格式（供模式A提前创建 AAC 音轨）
-    /// 采样率以设备 activeFormat 为准；声道数按需求**固定 2（立体声）**——
-    /// 依赖 activeFormat 的声道数不可靠（multichannelAudioMode 生效后
-    /// 实际采集声道可能与 activeFormat 不同），模式A需求即"固定立体声"。
+    /// 麦克风音频格式（供模式A判断"是否有麦克风"）
+    /// 注意：模式A音轨的声道数以音频首帧真实 ASBD 为准（ModeARecorder 懒创建），
+    /// 此处返回的实际声道数不再用于建轨，仅采样率/非 nil 用于判断有无麦克风。
     private func microphoneAudioFormat() -> (sampleRate: Double, channels: Int)? {
         guard let input = audioInput else { return nil }
         let fd = input.device.activeFormat.formatDescription
         guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) else { return nil }
-        return (asbd.pointee.mSampleRate, 2)
+        return (asbd.pointee.mSampleRate, Int(asbd.pointee.mChannelsPerFrame))
     }
 
     /// 录制完成（主线程回调）：保存到相册 + 复位状态
@@ -761,15 +760,21 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     /// 录制失败收尾：先保存一路可能已成功的文件，再上报错误
-    private func handleRecordingFailed(_ err: Error, successURLs: [URL] = []) {
+    /// - Parameters:
+    ///   - successURLs: 已成功完成的文件（保存到相册后删除临时文件）
+    ///   - failedURLs: 失败文件（保留在临时目录，错误提示带上路径；
+    ///     系统 tmp 目录会在适当时候自动回收，不手动删除防误删）
+    private func handleRecordingFailed(_ err: Error,
+                                       successURLs: [URL] = [],
+                                       failedURLs: [URL] = []) {
         stopElapsedTimer()
         isRecording = false
         applyPendingDowngrade()
         // 模式B一路失败、另一路成功：成功文件仍保存到相册（不丢弃）
         if !successURLs.isEmpty {
-            PhotoLibrarySaver.saveVideos(at: successURLs) { [weak self] savedURLs, failedURLs in
+            PhotoLibrarySaver.saveVideos(at: successURLs) { [weak self] savedURLs, savedFailed in
                 guard let self else { return }
-                if failedURLs.isEmpty {
+                if savedFailed.isEmpty {
                     self.showDegradationBanner("一路录制失败；成功的一段已保存到相册")
                 } else {
                     self.showDegradationBanner("一路录制失败；成功的一段也未能保存，文件位于临时目录")
@@ -779,7 +784,13 @@ final class CameraManager: NSObject, ObservableObject {
                 }
             }
         }
-        error = (err as? CameraError) ?? .recordingFailed(err.localizedDescription)
+        // 错误提示附带失败文件路径（便于用户手动找回）
+        var message = err.localizedDescription
+        if !failedURLs.isEmpty {
+            message += "；未保存文件位于临时目录："
+                + failedURLs.map(\.lastPathComponent).joined(separator: "、")
+        }
+        error = .recordingFailed(message)
     }
 
     private func startElapsedTimer() {
@@ -852,30 +863,44 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: - 应用事件
 
+    /// 通知观察者 token 数组（deinit 统一移除，避免悬挂回调）
+    private var observationTokens: [NSObjectProtocol] = []
+
     private func observeAppEvents() {
         // 退后台立即停止并保存（需求：录制期间退回后台停止录制并保存）
-        NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
-                                               object: nil, queue: .main) { [weak self] _ in
-            self?.stopRecording()
-        }
+        observationTokens.append(
+            NotificationCenter.default.addObserver(forName: UIApplication.didEnterBackgroundNotification,
+                                                   object: nil, queue: .main) { [weak self] _ in
+                self?.stopRecording()
+            })
         // 会话被中断（如来电）→ 停止并保存
-        NotificationCenter.default.addObserver(forName: AVCaptureSession.wasInterruptedNotification,
-                                               object: nil, queue: .main) { [weak self] note in
-            // 通知 userInfo 键名（Objective-C 常量，Swift 未暴露为静态成员，直接用字符串字面量）
-            if let reason = (note.userInfo?["AVCaptureSessionInterruptionReasonKey"] as? NSNumber)?.intValue,
-               reason == AVCaptureSession.InterruptionReason.audioDeviceInUseByAnotherClient.rawValue {
-                self?.showDegradationBanner("录音设备被其他应用占用，已停止录制")
-            }
-            self?.stopRecording()
-        }
+        observationTokens.append(
+            NotificationCenter.default.addObserver(forName: AVCaptureSession.wasInterruptedNotification,
+                                                   object: nil, queue: .main) { [weak self] note in
+                // 通知 userInfo 键名（Objective-C 常量，Swift 未暴露为静态成员，直接用字符串字面量）
+                if let reason = (note.userInfo?["AVCaptureSessionInterruptionReasonKey"] as? NSNumber)?.intValue,
+                   reason == AVCaptureSession.InterruptionReason.audioDeviceInUseByAnotherClient.rawValue {
+                    self?.showDegradationBanner("录音设备被其他应用占用，已停止录制")
+                }
+                self?.stopRecording()
+            })
         // 运行期错误 → 停止并提示
-        NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification,
-                                               object: nil, queue: .main) { [weak self] note in
-            // userInfo 中的错误是 NSError（Swift 桥接 as? AVError 在部分系统下会失败），
-            // 统一按 NSError 读取，保证异常分支稳定。
-            if let err = note.userInfo?["AVCaptureSessionErrorKey"] as? NSError {
-                self?.handleRecordingFailed(err)
-            }
+        observationTokens.append(
+            NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification,
+                                                   object: nil, queue: .main) { [weak self] note in
+                // userInfo 中的错误是 NSError（Swift 桥接 as? AVError 在部分系统下会失败），
+                // 统一按 NSError 读取，保证异常分支稳定。
+                if let err = note.userInfo?["AVCaptureSessionErrorKey"] as? NSError {
+                    self?.handleRecordingFailed(err)
+                }
+            })
+    }
+
+    /// 释放时停止会话并移除全部通知观察者
+    deinit {
+        session.stopRunning()
+        for token in observationTokens {
+            NotificationCenter.default.removeObserver(token)
         }
     }
 }

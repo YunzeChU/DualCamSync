@@ -13,8 +13,9 @@ import Foundation
 ///   因此各路样本的 PTS 处于同一时间基准，直接写入即可保证
 ///   两路画面帧级对齐、音画不错位。
 ///
-/// 声道策略：以真实采集到的音频格式为准动态创建 writer 输入
-///   （设备支持立体声则写入双声道 AAC；否则单声道），保证永不失配。
+/// 声道策略：音轨在**音频首帧**按真实采集格式懒创建
+///   （设备支持立体声则写入双声道 AAC；否则按实际声道写入，保证不失配不静音），
+///   并通过 startSessionIfNeeded 的"等待音频就绪"保证建轨先于 startWriting。
 final class ModeARecorder: NSObject,
     AVCaptureVideoDataOutputSampleBufferDelegate,
     AVCaptureAudioDataOutputSampleBufferDelegate {
@@ -60,6 +61,13 @@ final class ModeARecorder: NSObject,
     private var pendingA: (buffer: CVPixelBuffer, pts: CMTime)?
     private var pendingB: (buffer: CVPixelBuffer, pts: CMTime)?
 
+    /// 启动协调：视频首帧就绪后，最多等待音频首帧 audioStartTimeout 秒
+    /// （为按"音频真实声道数"懒创建音轨；超时则放弃音轨直接开写）。
+    private var videoReady = false
+    private var audioReady = false
+    private var videoFirstArrival: CFTimeInterval?
+    private let audioStartTimeout: CFTimeInterval = 0.5
+
     var onFinished: (([URL]) -> Void)?
     var onError: ((Error) -> Void)?
 
@@ -87,11 +95,11 @@ final class ModeARecorder: NSObject,
 
     // MARK: - 录制控制
 
-    /// 开始录制：创建写入器（视频轨 + 音轨均在此创建，等待首帧后写入）
+    /// 开始录制：创建写入器（视频轨在此创建；音轨由音频首帧懒创建）
     /// - Parameters:
-    ///   - audioFormat: 麦克风真实采样率/声道数；**音轨必须在 startWriting()
-    ///     之前 add**——AVAssetWriter 开始写入后不能再添加输入，
-    ///     否则合成 MP4 会无声轨（修复：音轨不再依赖"首个音频样本"才创建）。
+    ///   - audioFormat: 麦克风音频格式；**仅用于判断"是否有麦克风"**
+    ///     （nil = 无麦克风，启动时直接视为音频就绪）。音轨本身按
+    ///     音频首帧的真实 ASBD 创建（见 handleAudioSampleBuffer）。
     func start(outputSize: (width: Int32, height: Int32),
                layout: PreviewLayout,
                audioFormat: (sampleRate: Double, channels: Int)?) throws {
@@ -132,24 +140,11 @@ final class ModeARecorder: NSObject,
         }
         writer.add(videoInput)
 
-        // 音轨提前创建（startWriting 之前），按麦克风真实格式写 AAC。
-        // 声道数以实际采集为准（空间音频/立体声模式下为 2 声道，双声道立体声）。
-        var precreatedAudioInput: AVAssetWriterInput?
-        if let audioFormat {
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: audioFormat.sampleRate,
-                AVNumberOfChannelsKey: audioFormat.channels,
-                AVEncoderBitRateKey: 128_000,
-            ]
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
-            input.expectsMediaDataInRealTime = true
-            if writer.canAdd(input) {
-                writer.add(input)
-                precreatedAudioInput = input
-            }
-        }
-
+        // 音轨不在此提前创建：声道数必须以"真实采集到的音频样本"为准
+        // （multichannelAudioMode 生效后，实际声道可能与 activeFormat 不同；
+        // 固定 2 声道后丢弃非双声道样本会导致整段静音）。改为音频首帧
+        // 回调按真实 ASBD 懒创建，仍在 startWriting 之前完成——
+        // 由 startSessionIfNeeded 的"等待音频就绪"协调保证。
         self.writer = writer
         self.videoWriterInput = videoInput
         self.pixelAdaptor = adaptor
@@ -159,9 +154,12 @@ final class ModeARecorder: NSObject,
         self.recordingLandscape = outputSize.width > outputSize.height
         self.sessionStartTime = nil
         self.isWriting = false
-        self.audioWriterInput = precreatedAudioInput
+        self.audioWriterInput = nil
         self.pendingA = nil
         self.pendingB = nil
+        self.videoReady = false
+        self.audioReady = (audioFormat == nil)   // 无麦克风 → 无需等待音频
+        self.videoFirstArrival = nil
         self.isRecording = true
     }
 
@@ -191,7 +189,9 @@ final class ModeARecorder: NSObject,
                 if status == .completed {
                     self.onFinished?([url])
                 } else {
-                    self.onError?(CameraError.recordingFailed("写入失败 (\(status.rawValue))"))
+                    // 失败文件保留在临时目录，提示带上路径便于用户找回
+                    self.onError?(CameraError.recordingFailed(
+                        "写入失败 (\(status.rawValue))；未保存文件位于临时目录：\(url.lastPathComponent)"))
                 }
             }
             self.resetWriterState()
@@ -271,6 +271,12 @@ final class ModeARecorder: NSObject,
         let bufferB = b.buffer
         pairingLock.unlock()
 
+        // 标记视频就绪（供启动协调等待音频建轨；首帧时间记作等待起点）
+        startLock.lock()
+        videoReady = true
+        if videoFirstArrival == nil { videoFirstArrival = CACurrentMediaTime() }
+        startLock.unlock()
+
         startSessionIfNeeded(at: frameTime)
 
         guard let composed = compositor.composite(frameA: bufferA,
@@ -284,42 +290,41 @@ final class ModeARecorder: NSObject,
         adaptor.append(composed, withPresentationTime: frameTime)
     }
 
-    /// 音频回调：按真实声道数创建 AAC 音轨并写入
+    /// 音频回调：按真实声道数懒创建 AAC 音轨并写入
     /// 注意：AVCaptureConnection 没有 mediaType，需经 inputPorts 判断
     private func handleAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer,
                                         connection: AVCaptureConnection) {
         guard isRecording, connection.inputPorts.first?.mediaType == .audio else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
-        // 声道校验：writer 音轨按需求固定为双声道立体声（见 start 的
-        // audioFormat.channels=2）。若实际样本不是双声道（如设备立体声
-        // 模式未生效），直接丢弃该样本，避免 AVAssetWriter append 崩溃。
-        if let fd = CMSampleBufferGetFormatDescription(sampleBuffer),
-           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd),
-           Int(asbd.pointee.mChannelsPerFrame) != 2 {
-            return
-        }
-
-        // 兜底：正常路径 start() 已提前创建音轨；此分支仅在
-        // "写入尚未开始且音轨未就绪"时按真实声道数尝试创建。
-        // 一旦写入已开始（isWriting），AVAssetWriter 不允许再添加输入，直接丢弃音频。
+        // 音轨懒创建：按"真实采集到的音频样本"格式创建 AAC 输入
+        // （声道=实际采集：立体声模式生效写双声道，否则写单声道，保证不静音）。
+        // 必须在 startWriting 之前完成；若写入已开始（isWriting），
+        // AVAssetWriter 不允许再添加输入，放弃音频只保留视频。
         if audioWriterInput == nil {
-            guard !isWriting else { return }
-            guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-                  let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return }
-            let channels = Int(asbd.pointee.mChannelsPerFrame)
-            let sampleRate = asbd.pointee.mSampleRate
-            let settings: [String: Any] = [
-                AVFormatIDKey: kAudioFormatMPEG4AAC,
-                AVSampleRateKey: sampleRate,
-                AVNumberOfChannelsKey: channels,
-                AVEncoderBitRateKey: 128_000,
-            ]
-            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
-            input.expectsMediaDataInRealTime = true
-            guard let writer, writer.canAdd(input) else { return }
-            writer.add(input)
-            audioWriterInput = input
+            startLock.lock()
+            if !isWriting,
+               let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc),
+               let writer {
+                let channels = Int(asbd.pointee.mChannelsPerFrame)
+                let sampleRate = asbd.pointee.mSampleRate
+                let settings: [String: Any] = [
+                    AVFormatIDKey: kAudioFormatMPEG4AAC,
+                    AVSampleRateKey: sampleRate,
+                    AVNumberOfChannelsKey: channels,
+                    AVEncoderBitRateKey: 128_000,
+                ]
+                let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+                input.expectsMediaDataInRealTime = true
+                if writer.canAdd(input) {
+                    writer.add(input)
+                    audioWriterInput = input
+                }
+            }
+            // 无论建轨成败，音频都视为"settled"，不再阻塞写入启动
+            audioReady = true
+            startLock.unlock()
         }
 
         startSessionIfNeeded(at: pts)
@@ -344,11 +349,21 @@ final class ModeARecorder: NSObject,
     }
 
     /// 以首个样本时间作为会话起点（先到先定，后续样本时间必然 ≥ 起点）
-    /// 注意：视频A/视频B/音频三条队列并发调用，必须加锁保证只启动一次
+    /// 注意：视频A/视频B/音频三条队列并发调用，必须加锁保证只启动一次。
+    ///
+    /// 启动协调（修复"固定2声道丢弃非双声道导致整段静音"）：
+    /// 音轨按音频首帧真实声道数懒创建，因此 startWriting 需要等待——
+    ///   videoReady（视频首帧已配对） && ( audioReady（音轨已建 / 无麦克风）
+    ///   || 等待音频超时 0.5s ) 才真正开写，
+    /// 保证音轨创建始终在 startWriting 之前（AVAssetWriter 约束）。
     private func startSessionIfNeeded(at time: CMTime) {
         startLock.lock()
         defer { startLock.unlock() }
         guard !isWriting, let writer else { return }
+        let audioSettled = audioReady
+            || (videoFirstArrival != nil
+                && CACurrentMediaTime() - (videoFirstArrival ?? 0) > audioStartTimeout)
+        guard videoReady && audioSettled else { return }
         isWriting = true
         sessionStartTime = time
         writer.startWriting()

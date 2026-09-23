@@ -119,15 +119,18 @@ struct CameraView: View {
 
     // MARK: - 方向同步
 
+    /// 同步界面方向给相机层
+    /// 用 **windowScene.interfaceOrientation**（界面方向）而非 UIDevice.orientation
+    /// （物理方向）：物理方向含 faceUp/faceDown，且 Info.plist 不支持倒置时，
+    /// 物理倒置会被识别成 .portraitUpsideDown，出现"界面还是竖屏、预览被转 270°"
+    /// 的不一致。这里只映射工程实际支持的三个方向。
     private func syncOrientation() {
-        let device = UIDevice.current.orientation
-        let interface: UIInterfaceOrientation
-        switch device {
-        case .landscapeLeft:       interface = .landscapeLeft
-        case .landscapeRight:      interface = .landscapeRight
-        case .portraitUpsideDown:  interface = .portraitUpsideDown
-        default:                   interface = .portrait
-        }
+        let raw = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+            .first?.interfaceOrientation.rawValue
+            ?? UIInterfaceOrientation.portrait.rawValue
+        var interface = UIInterfaceOrientation(rawValue: raw) ?? .portrait
+        if interface == .portraitUpsideDown { interface = .portrait } // 不支持倒置
         camera.updateInterfaceOrientation(interface)
     }
 
