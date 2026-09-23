@@ -32,7 +32,8 @@ struct FunctionPanel: View {
             }
             .padding(16)
         }
-        .frame(width: 300, maxHeight: 540)   // 限高：内容少时面板贴合内容，避免玻璃铺满全屏
+        .frame(width: 300)   // 固定宽度
+        .frame(maxHeight: 540)   // 限高：内容少时贴合内容，横屏下自动 ≤ 屏高
         .glassPanel(cornerRadius: 30)
     }
 

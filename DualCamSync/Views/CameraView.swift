@@ -125,9 +125,10 @@ struct CameraView: View {
     /// 物理倒置会被识别成 .portraitUpsideDown，出现"界面还是竖屏、预览被转 270°"
     /// 的不一致。这里只映射工程实际支持的三个方向。
     private func syncOrientation() {
+        // iOS 26 中 UIWindowScene.interfaceOrientation 已弃用，改用 effectiveGeometry
         let raw = UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }
-            .first?.interfaceOrientation.rawValue
+            .first?.effectiveGeometry.interfaceOrientation.rawValue
             ?? UIInterfaceOrientation.portrait.rawValue
         var interface = UIInterfaceOrientation(rawValue: raw) ?? .portrait
         if interface == .portraitUpsideDown { interface = .portrait } // 不支持倒置

@@ -23,8 +23,6 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     private var pendingError: Error?
     /// 已成功完成录制的文件（一路失败时，另一路成功文件仍应保存到相册）
     private var finishedSuccessURLs: [URL] = []
-    /// 双输出启动失败置位：stop 回调直接忽略，错误由 start() 抛出
-    private var startAborted = false
 
     /// 两路都录制完成（主线程回调）
     var onFinished: (([URL]) -> Void)?
@@ -51,7 +49,10 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     // MARK: - 录制控制
 
     /// 同时启动两路录制（两路时间线同源，帧级对齐）
-    /// 任一路启动失败：立即停止已启动的一路并删除临时文件，向上抛错。
+    /// 注意：startRecording(to:recordingDelegate:) 返回 **Void**（并非 Bool），
+    /// 启动失败会经 didFinishRecordingTo 完成回调携带 error 上报。
+    /// 因此"双输出启动校验"由 fileOutput 完成回调统一处理：
+    /// 任一路报错立即停止另一路（避免一路失败另一路空录）。
     func start() throws {
         guard let outputA, let outputB, !outputA.isRecording, !outputB.isRecording else { return }
         let dir = FileManager.default.temporaryDirectory
@@ -62,21 +63,8 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         finishedCount = 0
         pendingError = nil
         finishedSuccessURLs = []
-        startAborted = false
-
-        let startedA = outputA.startRecording(to: urlA, recordingDelegate: self)
-        let startedB = outputB.startRecording(to: urlB, recordingDelegate: self)
-        guard startedA && startedB else {
-            // 双输出启动校验：任一路失败则停止已启动的、删除文件、抛错。
-            // startAborted 置位后，stopRecording 触发的完成回调直接忽略，
-            // 避免与这里的错误提示重复弹窗。
-            startAborted = true
-            if startedA { outputA.stopRecording() }
-            if startedB { outputB.stopRecording() }
-            try? FileManager.default.removeItem(at: urlA)
-            try? FileManager.default.removeItem(at: urlB)
-            throw CameraError.recordingFailed("录制输出启动失败（一路未就绪）")
-        }
+        outputA.startRecording(to: urlA, recordingDelegate: self)
+        outputB.startRecording(to: urlB, recordingDelegate: self)
     }
 
     func stop() {
@@ -90,16 +78,17 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                     didFinishRecordingTo outputFileURL: URL,
                     from connections: [AVCaptureConnection],
                     error: Error?) {
-        // 启动失败分支的 stop 回调直接忽略（错误已在 start() 抛出）
-        finishLock.lock()
-        let aborted = startAborted
-        finishLock.unlock()
-        guard !aborted else { return }
-
         // 两路完成回调可能并发：先入队计数，回到主线程后再统一回调一次
         finishLock.lock()
         if let error, pendingError == nil {
             pendingError = error
+            // 任一路启动/录制失败：立即停止另一路（若仍在录制），
+            // 成功完成的一段仍会走保存逻辑（onError 携带 successURLs）
+            if output === outputA {
+                outputB?.stopRecording()
+            } else {
+                outputA?.stopRecording()
+            }
         } else if error == nil {
             finishedSuccessURLs.append(outputFileURL)
         }

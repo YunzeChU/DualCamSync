@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import CoreVideo
 import Photos
 import SwiftUI
 import UIKit
@@ -526,9 +527,12 @@ final class CameraManager: NSObject, ObservableObject {
     /// dvhe 容器、内容仍是 SDR，观感上不是 HDR。
     private func applyDolbySetting() {
         let useDolby = dolbyVisionEnabled && isDolbyVisionAvailable
-        // 预览连接 + 录制连接统一开关视频 HDR 管线（设备不支持时是 no-op）
-        for conn in [previewConnA, previewConnB, activeVideoConnA, activeVideoConnB] {
-            conn?.isVideoHDREnabled = useDolby
+        // 注意：iOS 26 SDK 已移除 AVCaptureConnection.isVideoHDREnabled
+        // （iOS 7 时代旧 API）。杜比视界 HDR 生效的正确路径：
+        //   1) activeFormat 切换为同分辨率/帧率的 10-bit HDR 格式（applyHDRFormat）
+        //   2) MovieFileOutput 输出编码器设为 dvhe（下方已有）
+        if useDolby {
+            applyHDRFormat()
         }
         guard mode == .dualFiles, let outA = movieOutputA, let outB = movieOutputB else { return }
         let codec: AVVideoCodecType = useDolby ? Self.dolbyVisionCodec : .hevc
@@ -537,6 +541,39 @@ final class CameraManager: NSObject, ObservableObject {
                 out.setOutputSettings([AVVideoCodecKey: codec], for: conn)
             }
         }
+    }
+
+    /// 杜比视界开启时：把两台设备 activeFormat 切到同档 10-bit HDR 格式。
+    /// DV 的 HDR 内容由 10-bit 采集格式承载（编码器 dvhe 只是容器）——
+    /// 若格式仍是 8-bit，成片即使带 dvhe 容器观感也是 SDR。
+    private func applyHDRFormat() {
+        for device in [cameraA?.device, cameraB?.device].compactMap({ $0 }) {
+            let dims = CMFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+            guard let hdr = findHDRFormat(for: device, width: dims.width, height: dims.height),
+                  hdr != device.activeFormat else { continue }
+            try? device.lockForConfiguration()
+            device.activeFormat = hdr
+            device.unlockForConfiguration()
+        }
+    }
+
+    /// 查找与当前宽高匹配、且支持目标帧率的 10-bit HDR 格式
+    private func findHDRFormat(for device: AVCaptureDevice,
+                               width: Int32, height: Int32) -> AVCaptureDevice.Format? {
+        let targetFPS = Double(preset.maxFrameRate)
+        let targetVideoRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+        let targetFullRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
+        for format in device.formats {
+            let desc = format.formatDescription
+            // HDR 视频 = 10-bit 双平面（VideoRange / FullRange）
+            let subtype = UInt32(CMFormatDescriptionGetMediaSubType(desc))
+            guard subtype == targetVideoRange || subtype == targetFullRange else { continue }
+            let dims = CMFormatDescriptionGetDimensions(desc)
+            guard dims.width == width, dims.height == height else { continue }
+            guard format.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= targetFPS - 0.5 }) else { continue }
+            return format
+        }
+        return nil
     }
 
     /// 刷新各档位可用性（UI 置灰依据）
