@@ -23,20 +23,22 @@ final class CameraManager: NSObject, ObservableObject {
     let session = AVCaptureMultiCamSession()
 
     /// 两路独立预览层（视图层通过 PreviewLayerView 包装渲染）
-    /// 使用 lazy + sessionWithNoConnection：多摄会话禁止自动建连，
-    /// 连接由本类在配置阶段手动创建；lazy 避免初始化顺序问题。
-    lazy var previewLayerA: AVCaptureVideoPreviewLayer = {
-        let layer = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
-        layer.videoGravity = .resizeAspectFill
-        return layer
-    }()
-    lazy var previewLayerB: AVCaptureVideoPreviewLayer = {
-        let layer = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
-        layer.videoGravity = .resizeAspectFill
-        return layer
-    }()
+    /// 每次会话重配都**重建全新实例** + 递增 previewGeneration 触发 SwiftUI
+    /// 用 .id 强制重建预览容器——绕开多摄经典坑：teardown 移除连接后
+    /// previewLayer.connection 残留，下一次 canAddConnection 失败 → 一路黑屏。
+    /// private(set)：本文件可重建赋值，视图层只读。
+    private(set) var previewLayerA: AVCaptureVideoPreviewLayer!
+    private(set) var previewLayerB: AVCaptureVideoPreviewLayer!
+    /// 预览层代际号：每次重建预览层 +1，CameraView 用 .id 强制重建预览容器
+    @Published var previewGeneration = 0
     private var previewConnA: AVCaptureConnection?
     private var previewConnB: AVCaptureConnection?
+
+    private static func makePreviewLayer(session: AVCaptureSession) -> AVCaptureVideoPreviewLayer {
+        let layer = AVCaptureVideoPreviewLayer(sessionWithNoConnection: session)
+        layer.videoGravity = .resizeAspectFill
+        return layer
+    }
 
     // MARK: - 对外状态（SwiftUI 驱动）
 
@@ -54,6 +56,8 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var exposureBias: [Float] = [0, 0]      // 每路曝光补偿
 
     @Published var isRecording = false
+    /// 成片收尾中（点停止后文件仍在异步写入/保存；期间禁止再次开始录制）
+    @Published var isFinalizing = false
     @Published var recordingElapsed: TimeInterval = 0
     @Published var interfaceOrientation: UIInterfaceOrientation = .portrait
 
@@ -133,6 +137,9 @@ final class CameraManager: NSObject, ObservableObject {
 
     override init() {
         super.init()
+        // 预览层在 init 中创建（session 为声明时初始化的 let，此处可安全访问）
+        previewLayerA = Self.makePreviewLayer(session: session)
+        previewLayerB = Self.makePreviewLayer(session: session)
         modeARecorder.manager = self
         observeAppEvents()
     }
@@ -263,7 +270,11 @@ final class CameraManager: NSObject, ObservableObject {
             try applyFormat(device: camA.device, preset: preset)
             try applyFormat(device: camB.device, preset: preset)
 
-            // 预览层连接（手动建连）
+            // 预览层连接（手动建连）：每次配置用全新预览层实例，
+            // 避免旧连接残留导致 canAddConnection 失败（一路黑屏的根因）
+            previewLayerA = Self.makePreviewLayer(session: session)
+            previewLayerB = Self.makePreviewLayer(session: session)
+            previewGeneration += 1
             previewConnA = makePreviewConnection(layer: previewLayerA, input: inputA)
             previewConnB = makePreviewConnection(layer: previewLayerB, input: inputB)
 
@@ -291,8 +302,12 @@ final class CameraManager: NSObject, ObservableObject {
             refreshDolbyCapability()
 
             // 预览连接建立失败不能静默：双摄预览只有一路，用户无法发现。
-            if previewConnA == nil || previewConnB == nil {
-                error = .configurationFailed("预览层连接建立失败，请尝试重新选择镜头组合")
+            // 细化到 A/B 哪一路失败，便于定位。
+            let aOK = previewConnA != nil
+            let bOK = previewConnB != nil
+            if !aOK || !bOK {
+                error = .configurationFailed(
+                    "预览层建立失败（A 路\(aOK ? "正常" : "失败")、B 路\(bOK ? "正常" : "失败")），请尝试重新选择镜头组合")
             }
         } catch {
             session.commitConfiguration()
@@ -533,13 +548,12 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// 杜比视界能力探测 + 应用（仅双文件模式；合成路径不支持）
     /// -------------------------------------------------------------
-    /// 修复"杜比视界一直灰、开不了"：
-    ///  1. 探测时机移到 commit + startRunning 之后（availableVideoCodecTypes
-    ///     在输出未就绪时为空数组，过早探测误判为不可用）；
-    ///  2. 双重判据：输出支持 dvhe 编码器（列表为空时视为"查询未就绪"不判死）
-    ///     + 两台设备都具备 10-bit HDR 采集格式（HDR 内容由 10-bit 承载）。
+    /// 判据只有一条：两路设备都具备 10-bit HDR 采集格式。
+    /// 注意：**不能**依赖 MovieFileOutput.availableVideoCodecTypes——
+    /// 该列表在设备 activeFormat 还是 8-bit 时不含 dvhe，
+    /// 会把支持杜比视界的设备（iPhone 17 Pro）误判为"不支持"导致开关永远灰。
     private func refreshDolbyCapability() {
-        guard mode == .dualFiles, let outA = movieOutputA else {
+        guard mode == .dualFiles, cameraA != nil, cameraB != nil else {
             let wasAvailable = isDolbyVisionAvailable
             isDolbyVisionAvailable = false
             if dolbyVisionEnabled {
@@ -548,20 +562,11 @@ final class CameraManager: NSObject, ObservableObject {
             }
             return
         }
-        // 1) 输出编码器支持 dvhe（iPhone 上 MovieFileOutput 应列出；
-        //    查询过早列表为空 → 不据此判死，交给设备格式判据兜底）
-        let codecOK: Bool
-        if outA.availableVideoCodecTypes.isEmpty {
-            codecOK = true
-        } else {
-            codecOK = outA.availableVideoCodecTypes.contains { $0.rawValue == "dvhe" }
-        }
-        // 2) 两路设备都具备 10-bit HDR 采集格式
         let deviceOK = [cameraA?.device, cameraB?.device]
             .compactMap { $0 }
             .allSatisfy(deviceSupportsHDRCapture)
 
-        isDolbyVisionAvailable = codecOK && deviceOK
+        isDolbyVisionAvailable = deviceOK
         if dolbyVisionEnabled && !isDolbyVisionAvailable {
             dolbyVisionEnabled = false
             showDegradationBanner("杜比视界当前不可用，已自动关闭")
@@ -800,19 +805,25 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// 开始录制：按当前布局/方向/规格启动对应录制器
     func startRecording() {
-        guard !isRecording, isMultiCamSupported, cameraA != nil, cameraB != nil else { return }
+        guard !isRecording, !isFinalizing, isMultiCamSupported, cameraA != nil, cameraB != nil else {
+            if isFinalizing {
+                // 上一段还在收尾（约 1 秒）：明确提示，避免"点了没反应"
+                error = .recordingFailed("上一段视频正在保存，请稍候再录")
+            }
+            return
+        }
         // 会话未就绪时明确报错，避免"点了没反应"的错觉（按键必须立即有反馈）
         guard session.isRunning else {
             error = .recordingFailed("相机会话未就绪，请稍后重试")
             return
         }
         do {
-            // 录制前强制把两路录制连接的方向与当前界面方向对齐
-            // （applyOrientation 在未录制时会同步 activeVideoConnA/B），
-            // 保证 A/B 两路成片朝向一致、与预览一致（修复朝向不一致）。
+            // 录制前把两路录制输出的**全部启用视频连接**方向对齐到当前界面方向，
+            // 保证 A/B 两路成片朝向一致、与预览一致（修复一路横一路竖）。
+            lockOutputOrientations()
             applyOrientation()
-            // 两路连接的方向已在 applyOrientation() 中跟随界面锁定，
-            // 录制起点即当前方向；录制期间不再跟随旋转（成片方向固定）。
+            // 两路连接的方向已在上面锁定，录制起点即当前方向；
+            // 录制期间不再跟随旋转（成片方向固定）。
             switch mode {
             case .dualFiles:
                 try modeBRecorder.start()
@@ -830,11 +841,30 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     /// 停止录制（保存由录制器回调统一触发）
+    /// 点按立即复位 UI（按钮/计时），成片由录制器异步收尾并保存——
+    /// 修复"点停止后要空等约 1 秒才终止"的卡顿感。
     func stopRecording() {
         guard isRecording else { return }
+        isFinalizing = true
+        stopElapsedTimer()
+        isRecording = false
         switch mode {
         case .dualFiles: modeBRecorder.stop()
         case .composite: modeARecorder.stop()
+        }
+    }
+
+    /// 录制前把两路 MovieFileOutput 的全部启用视频连接方向对齐到当前界面方向。
+    /// 逐个遍历设置（不依赖 videoConnection(of:) 只取第一个连接），
+    /// 从根上保证 A/B 成片朝向一致。
+    private func lockOutputOrientations() {
+        let angle = Self.rotationAngle(for: interfaceOrientation)
+        for out in [movieOutputA, movieOutputB].compactMap({ $0 }) {
+            for conn in out.connections where conn.isEnabled {
+                if conn.inputPorts.first?.mediaType == .video {
+                    conn.videoRotationAngle = angle
+                }
+            }
         }
     }
 
@@ -859,6 +889,7 @@ final class CameraManager: NSObject, ObservableObject {
     private func handleRecordingFinished(urls: [URL]) {
         stopElapsedTimer()
         isRecording = false
+        isFinalizing = false
         applyPendingDowngrade()   // 内存告警等触发的"录制结束后降级"在此闭环
         guard !urls.isEmpty else { return }
         PhotoLibrarySaver.saveVideos(at: urls,
@@ -890,6 +921,7 @@ final class CameraManager: NSObject, ObservableObject {
                                        failedURLs: [URL] = []) {
         stopElapsedTimer()
         isRecording = false
+        isFinalizing = false
         applyPendingDowngrade()
         // 模式B一路失败、另一路成功：成功文件仍保存到相册（不丢弃）
         if !successURLs.isEmpty {

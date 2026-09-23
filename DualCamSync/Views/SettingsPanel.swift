@@ -116,7 +116,7 @@ struct SettingsPanel: View {
         }
         .frame(width: 360)   // 固定宽度（内容与玻璃边缘留足呼吸空间）
         .frame(maxHeight: 560)   // 限高：竖屏贴合 560，横屏受限父级自动 ≤ 屏高
-        .glassPanel(cornerRadius: 32)
+        .glassPanel(cornerRadius: 28)
     }
 
     // MARK: - 组件

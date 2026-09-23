@@ -34,7 +34,7 @@ struct FunctionPanel: View {
         }
         .frame(width: 320)   // 固定宽度（内容与玻璃边缘留足呼吸空间）
         .frame(maxHeight: 540)   // 限高：内容少时贴合内容，横屏下自动 ≤ 屏高
-        .glassPanel(cornerRadius: 30)
+        .glassPanel(cornerRadius: 28)
     }
 
     // MARK: - 分区组件
