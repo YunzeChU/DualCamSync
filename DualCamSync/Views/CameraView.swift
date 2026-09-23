@@ -37,20 +37,37 @@ struct CameraView: View {
                 // 录制中红色计时（顶部居中）
                 recordingTimerView
 
-                // 功能面板（液态玻璃二级菜单）
+                // 功能面板（液态玻璃二级菜单，从功能键所在侧弹出：
+                // 竖屏从底部、横屏从右侧，弹簧+缩放+模糊，贴近原生菜单）
                 if showingFunction {
                     overlayDim()
                         .onTapGesture { dismissAllPanels() }
                     FunctionPanel { dismissAllPanels() }
-                        .transition(.scale(scale: 0.88).combined(with: .opacity))
+                        .padding(isLandscape ? .trailing : .bottom,
+                                 isLandscape ? 30 : 120)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity,
+                               alignment: isLandscape ? .trailing : .bottom)
+                        .transition(
+                            .scale(scale: 0.82, anchor: isLandscape ? .trailing : .bottom)
+                                .combined(with: .opacity)
+                                .combined(with: .move(edge: isLandscape ? .trailing : .bottom))
+                        )
                 }
 
-                // 设置面板（液态玻璃弹层）
+                // 设置面板（液态玻璃弹层，从设置键所在侧弹出）
                 if showingSettings {
                     overlayDim()
                         .onTapGesture { dismissAllPanels() }
                     SettingsPanel { dismissAllPanels() }
-                        .transition(.scale(scale: 0.88).combined(with: .opacity))
+                        .padding(isLandscape ? .trailing : .bottom,
+                                 isLandscape ? 30 : 120)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity,
+                               alignment: isLandscape ? .trailing : .bottom)
+                        .transition(
+                            .scale(scale: 0.82, anchor: isLandscape ? .trailing : .bottom)
+                                .combined(with: .opacity)
+                                .combined(with: .move(edge: isLandscape ? .trailing : .bottom))
+                        )
                 }
 
                 // 降级/提示横幅

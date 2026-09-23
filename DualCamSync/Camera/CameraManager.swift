@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreMedia
 import Photos
 import SwiftUI
 import UIKit
@@ -46,7 +47,8 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var dolbyVisionEnabled = false
     @Published var spatialAudioEnabled = true
     @Published var stabilizationEnabled = [true, true]
-    @Published var lockState = [false, false]          // 每路 AE/AF 锁定
+    @Published var focusLockState = [false, false]      // 每路对焦锁定
+    @Published var exposureLockState = [false, false]   // 每路曝光锁定（与对焦独立）
     @Published var exposureBias: [Float] = [0, 0]      // 每路曝光补偿
 
     @Published var isRecording = false
@@ -72,6 +74,8 @@ final class CameraManager: NSObject, ObservableObject {
     private var audioInput: AVCaptureDeviceInput?
     private var didStart = false
     private var elapsedTimer: Timer?
+    /// 内存告警等触发的"录制结束后降级目标"（录制中无法立即重配会话）
+    private var pendingDowngrade: ResolutionPreset?
 
     // 模式B（双文件）输出
     private var movieOutputA: AVCaptureMovieFileOutput?
@@ -149,9 +153,14 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     /// 枚举全部可用镜头（后置超广角/广角/长焦 + 前置）
+    /// 注意：iPhone 前置摄像头的 deviceType 是 .builtInTrueDepthCamera
+    /// （不是 wideAngle），漏掉它会导致"前置+后置"组合选不到，必须包含。
     private func discoverCameras() {
         let discovery = AVCaptureDevice.DiscoverySession(
-            deviceTypes: [.builtInWideAngleCamera, .builtInUltraWideCamera, .builtInTelephotoCamera],
+            deviceTypes: [.builtInWideAngleCamera,
+                          .builtInUltraWideCamera,
+                          .builtInTelephotoCamera,
+                          .builtInTrueDepthCamera],
             mediaType: .video,
             position: .unspecified
         )
@@ -212,6 +221,10 @@ final class CameraManager: NSObject, ObservableObject {
               let camB = cameraB else { return }
         // 录制中不允许改动会话结构
         guard !isRecording else { return }
+
+        // 降级闭环：配置前先校验当前档位可用性，不可用先自动降级再配置，
+        // 避免 applyFormat 直接抛错（需求：不支持的规格自动置灰/降级）
+        ensurePresetSupported(for: camA.device, and: camB.device)
 
         session.beginConfiguration()
         teardownSession()
@@ -487,12 +500,23 @@ final class CameraManager: NSObject, ObservableObject {
     private static let dolbyVisionCodec = AVVideoCodecType(rawValue: "dvhe")
 
     /// 杜比视界能力探测 + 应用（仅双文件模式；合成路径不支持）
+    /// 修复：能力不可用时同步关闭 dolbyVisionEnabled 开关，避免 UI 出现
+    /// "开关开着但实际没开"的状态不一致。
     private func refreshDolbyCapability() {
         guard mode == .dualFiles, let outA = movieOutputA else {
+            let wasAvailable = isDolbyVisionAvailable
             isDolbyVisionAvailable = false
+            if dolbyVisionEnabled {
+                dolbyVisionEnabled = false
+                if wasAvailable { showDegradationBanner("杜比视界当前不可用，已自动关闭") }
+            }
             return
         }
         isDolbyVisionAvailable = outA.availableVideoCodecTypes.contains { $0.rawValue == "dvhe" }
+        if dolbyVisionEnabled && !isDolbyVisionAvailable {
+            dolbyVisionEnabled = false
+            showDegradationBanner("杜比视界当前不可用，已自动关闭")
+        }
         applyDolbySetting()
     }
 
@@ -517,7 +541,8 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    /// 刷新各档位可用性；当前档位不可用时自动降级到最高可用档位
+    /// 刷新各档位可用性（UI 置灰依据）
+    /// 降级动作统一由 ensurePresetSupported 在配置前完成（闭环）。
     private func refreshCapabilities() {
         guard let camA = cameraA, let camB = cameraB else { return }
         var availability: [ResolutionPreset: Bool] = [:]
@@ -526,14 +551,23 @@ final class CameraManager: NSObject, ObservableObject {
                 && CameraPairProbe.shared.supportsPreset(camB.device, p)
         }
         presetAvailability = availability
+    }
 
-        if availability[preset] == false {
-            let old = preset
-            if let fallback = ResolutionPreset.allCases.first(where: { availability[$0] == true }) {
-                preset = fallback
-                showDegradationBanner("当前镜头组合不支持 \(old.displayName)，已自动降级到 \(fallback.displayName)")
-            }
+    /// 当前档位在两台设备上不可用时，自动降级到最高可用档位
+    /// 在 applyConfiguration 配置前调用，保证 applyFormat 一定落在可用档位上。
+    private func ensurePresetSupported(for deviceA: AVCaptureDevice,
+                                       and deviceB: AVCaptureDevice) {
+        if CameraPairProbe.shared.supportsPreset(deviceA, preset),
+           CameraPairProbe.shared.supportsPreset(deviceB, preset) {
+            return
         }
+        let old = preset
+        guard let fallback = ResolutionPreset.allCases.first(where: {
+            CameraPairProbe.shared.supportsPreset(deviceA, $0)
+                && CameraPairProbe.shared.supportsPreset(deviceB, $0)
+        }) else { return }
+        preset = fallback
+        showDegradationBanner("当前镜头组合不支持 \(old.displayName)，已自动降级到 \(fallback.displayName)")
     }
 
     // MARK: - 对外设置方法（全部在非录制状态下生效）
@@ -582,54 +616,14 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
         if slot == .a { cameraA = option } else { cameraB = option }
-        lockState = [false, false]
+        // 换镜头后复位两路的对焦/曝光锁定（与曝光补偿）
+        focusLockState = [false, false]
+        exposureLockState = [false, false]
         exposureBias = [0, 0]
         applyConfiguration()
     }
 
-    // MARK: - 对焦 / 曝光（每路独立）
-
-    /// 点按对焦+点测光（devicePoint 为设备坐标系下的归一化坐标）
-    func focus(at devicePoint: CGPoint, slot: CameraSlot) {
-        guard let device = device(for: slot) else { return }
-        try? device.lockForConfiguration()
-        if device.isFocusPointOfInterestSupported {
-            device.focusPointOfInterest = devicePoint
-            device.focusMode = .autoFocus
-        }
-        if device.isExposurePointOfInterestSupported {
-            device.exposurePointOfInterest = devicePoint
-            device.exposureMode = .autoExpose
-        }
-        device.unlockForConfiguration()
-    }
-
-    /// 切换该路 AE/AF 锁定
-    func toggleLock(slot: CameraSlot) {
-        lockState[slot.index].toggle()
-        applyLock(slot: slot)
-    }
-
-    /// 设置面板用：按给定状态锁定/解锁该路 AE/AF
-    func setLock(_ locked: Bool, slot: CameraSlot) {
-        guard !isRecording, lockState[slot.index] != locked else { return }
-        lockState[slot.index] = locked
-        applyLock(slot: slot)
-    }
-
-    private func applyLock(slot: CameraSlot) {
-        guard let device = device(for: slot) else { return }
-        let locked = lockState[slot.index]
-        try? device.lockForConfiguration()
-        if locked {
-            if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
-            if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
-        } else {
-            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
-            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
-        }
-        device.unlockForConfiguration()
-    }
+    // MARK: - 曝光（每路独立）
 
     /// 手动曝光补偿（每路独立）
     func setExposureBias(_ value: Float, slot: CameraSlot) {
@@ -649,9 +643,38 @@ final class CameraManager: NSObject, ObservableObject {
         (slot == .a ? cameraA : cameraB)?.device
     }
 
-    /// 将预览层的点转换为设备归一化坐标（点按对焦用）
-    func devicePoint(for location: CGPoint, in layer: AVCaptureVideoPreviewLayer) -> CGPoint {
-        layer.captureDevicePointConverted(fromLayerPoint: location)
+    // MARK: - 对焦 / 曝光锁定（每路对焦、曝光各自独立）
+
+    /// 设置面板用：锁定/解锁该路对焦（不影响曝光）
+    func setFocusLock(_ locked: Bool, slot: CameraSlot) {
+        guard !isRecording, focusLockState[slot.index] != locked else { return }
+        focusLockState[slot.index] = locked
+        applyLock(slot: slot)
+    }
+
+    /// 设置面板用：锁定/解锁该路曝光（不影响对焦）
+    func setExposureLock(_ locked: Bool, slot: CameraSlot) {
+        guard !isRecording, exposureLockState[slot.index] != locked else { return }
+        exposureLockState[slot.index] = locked
+        applyLock(slot: slot)
+    }
+
+    private func applyLock(slot: CameraSlot) {
+        guard let device = device(for: slot) else { return }
+        try? device.lockForConfiguration()
+        // 对焦：锁定/连续自动对焦
+        if focusLockState[slot.index] {
+            if device.isFocusModeSupported(.locked) { device.focusMode = .locked }
+        } else {
+            if device.isFocusModeSupported(.continuousAutoFocus) { device.focusMode = .continuousAutoFocus }
+        }
+        // 曝光：锁定/连续自动曝光（独立开关，可单独锁其一）
+        if exposureLockState[slot.index] {
+            if device.isExposureModeSupported(.locked) { device.exposureMode = .locked }
+        } else {
+            if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
+        }
+        device.unlockForConfiguration()
     }
 
     // MARK: - 录制
@@ -672,7 +695,9 @@ final class CameraManager: NSObject, ObservableObject {
                 try modeBRecorder.start()
             case .composite:
                 let target = targetOutputDimensions()
-                try modeARecorder.start(outputSize: target, layout: layout)
+                try modeARecorder.start(outputSize: target,
+                                        layout: layout,
+                                        audioFormat: microphoneAudioFormat())
             }
             isRecording = true
             startElapsedTimer()
@@ -697,22 +722,33 @@ final class CameraManager: NSObject, ObservableObject {
         return isPortrait ? (base.height, base.width) : base
     }
 
+    /// 麦克风当前真实音频格式（采样率/声道数），供模式A提前创建 AAC 音轨
+    private func microphoneAudioFormat() -> (sampleRate: Double, channels: Int)? {
+        guard let input = audioInput else { return nil }
+        let fd = input.device.activeFormat.formatDescription
+        guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) else { return nil }
+        return (asbd.pointee.mSampleRate, Int(asbd.pointee.mChannelsPerFrame))
+    }
+
     /// 录制完成（主线程回调）：保存到相册 + 复位状态
     private func handleRecordingFinished(urls: [URL]) {
         stopElapsedTimer()
         isRecording = false
+        applyPendingDowngrade()   // 内存告警等触发的"录制结束后降级"在此闭环
         guard !urls.isEmpty else { return }
-        PhotoLibrarySaver.saveVideos(at: urls) { [weak self] saved, failed in
+        PhotoLibrarySaver.saveVideos(at: urls) { [weak self] savedURLs, failedURLs in
             guard let self else { return }
-            if failed == 0 {
-                self.showDegradationBanner("已保存 \(saved) 段视频到相册")
-            } else if saved == 0 {
-                self.error = .recordingFailed("视频保存失败，文件位于 \(urls.map(\.lastPathComponent).joined(separator: "、"))")
+            if failedURLs.isEmpty {
+                self.showDegradationBanner("已保存 \(savedURLs.count) 段视频到相册")
+            } else if savedURLs.isEmpty {
+                self.error = .recordingFailed(
+                    "视频保存失败，文件位于 \(failedURLs.map(\.lastPathComponent).joined(separator: "、"))（临时目录）")
             } else {
-                self.showDegradationBanner("已保存 \(saved) 段；另有 \(failed) 段保存失败")
+                self.showDegradationBanner(
+                    "已保存 \(savedURLs.count) 段；另有 \(failedURLs.count) 段保存失败")
             }
-            // 保存完成后清理临时文件
-            for url in urls {
+            // 仅删除"保存成功"的临时文件；失败文件保留在临时目录，便于手动找回
+            for url in savedURLs {
                 try? FileManager.default.removeItem(at: url)
             }
         }
@@ -721,6 +757,7 @@ final class CameraManager: NSObject, ObservableObject {
     private func handleRecordingFailed(_ err: Error) {
         stopElapsedTimer()
         isRecording = false
+        applyPendingDowngrade()
         error = (err as? CameraError) ?? .recordingFailed(err.localizedDescription)
     }
 
@@ -755,8 +792,13 @@ final class CameraManager: NSObject, ObservableObject {
     private func handleMemoryChange(_ level: SystemMonitor.Level) {
         switch level {
         case .warning:
-            showDegradationBanner("内存压力较大，已自动降级到 1080P30")
-            if preset != .hd30 {
+            // 内存告警几乎总在录制中触发；此时先停止录制并保存当前成片，
+            // 再把降级挂起，等录制收尾（isRecording=false）后统一重配到 1080P30。
+            showDegradationBanner("内存压力较大：已停止录制，结束后自动降级到 1080P30")
+            if isRecording {
+                pendingDowngrade = .hd30
+                stopRecording()
+            } else if preset != .hd30 {
                 preset = .hd30
                 applyConfiguration()
             }
@@ -766,6 +808,15 @@ final class CameraManager: NSObject, ObservableObject {
         case .normal:
             break
         }
+    }
+
+    /// 录制收尾后执行挂起的降级（内存告警场景）
+    private func applyPendingDowngrade() {
+        guard let target = pendingDowngrade else { return }
+        pendingDowngrade = nil
+        guard preset != target else { return }
+        preset = target
+        applyConfiguration()
     }
 
     private func showDegradationBanner(_ text: String) {

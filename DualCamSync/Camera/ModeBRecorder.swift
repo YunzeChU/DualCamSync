@@ -17,6 +17,8 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     private var outputA: AVCaptureMovieFileOutput?
     private var outputB: AVCaptureMovieFileOutput?
     private var currentURLs: [URL] = []
+    /// 两个输出可能在不同线程并发回调完成事件，计数与错误需加锁保护
+    private let finishLock = NSLock()
     private var finishedCount = 0
     private var pendingError: Error?
 
@@ -68,14 +70,17 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                     didFinishRecordingTo outputFileURL: URL,
                     from connections: [AVCaptureConnection],
                     error: Error?) {
+        // 两路完成回调可能并发：先入队计数，回到主线程后再统一回调一次
+        finishLock.lock()
         if let error, pendingError == nil {
             pendingError = error
         }
         finishedCount += 1
-        // 两路都结束后统一回调一次
-        guard finishedCount >= 2 else { return }
+        let allDone = finishedCount >= 2
         let err = pendingError
-        pendingError = nil
+        finishLock.unlock()
+
+        guard allDone else { return }
         DispatchQueue.main.async {
             if let err {
                 self.onError?(err)

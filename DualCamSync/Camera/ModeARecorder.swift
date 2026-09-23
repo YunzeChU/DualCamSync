@@ -87,9 +87,14 @@ final class ModeARecorder: NSObject,
 
     // MARK: - 录制控制
 
-    /// 开始录制：创建写入器，等待首帧后写入
+    /// 开始录制：创建写入器（视频轨 + 音轨均在此创建，等待首帧后写入）
+    /// - Parameters:
+    ///   - audioFormat: 麦克风真实采样率/声道数；**音轨必须在 startWriting()
+    ///     之前 add**——AVAssetWriter 开始写入后不能再添加输入，
+    ///     否则合成 MP4 会无声轨（修复：音轨不再依赖"首个音频样本"才创建）。
     func start(outputSize: (width: Int32, height: Int32),
-               layout: PreviewLayout) throws {
+               layout: PreviewLayout,
+               audioFormat: (sampleRate: Double, channels: Int)?) throws {
         guard !isRecording else { return }
         guard manager != nil else {
             throw CameraError.configurationFailed("录制器未就绪")
@@ -127,6 +132,24 @@ final class ModeARecorder: NSObject,
         }
         writer.add(videoInput)
 
+        // 音轨提前创建（startWriting 之前），按麦克风真实格式写 AAC。
+        // 声道数以实际采集为准（空间音频/立体声模式下为 2 声道，双声道立体声）。
+        var precreatedAudioInput: AVAssetWriterInput?
+        if let audioFormat {
+            let settings: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: audioFormat.sampleRate,
+                AVNumberOfChannelsKey: audioFormat.channels,
+                AVEncoderBitRateKey: 128_000,
+            ]
+            let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
+            input.expectsMediaDataInRealTime = true
+            if writer.canAdd(input) {
+                writer.add(input)
+                precreatedAudioInput = input
+            }
+        }
+
         self.writer = writer
         self.videoWriterInput = videoInput
         self.pixelAdaptor = adaptor
@@ -136,7 +159,7 @@ final class ModeARecorder: NSObject,
         self.recordingLandscape = outputSize.width > outputSize.height
         self.sessionStartTime = nil
         self.isWriting = false
-        self.audioWriterInput = nil
+        self.audioWriterInput = precreatedAudioInput
         self.pendingA = nil
         self.pendingB = nil
         self.isRecording = true
@@ -254,8 +277,11 @@ final class ModeARecorder: NSObject,
         guard isRecording, connection.inputPorts.first?.mediaType == .audio else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
 
-        // 首次收到音频时，按真实声道数/采样率创建音频输入（立体声优先）
+        // 兜底：正常路径 start() 已提前创建音轨；此分支仅在
+        // "写入尚未开始且音轨未就绪"时按真实声道数尝试创建。
+        // 一旦写入已开始（isWriting），AVAssetWriter 不允许再添加输入，直接丢弃音频。
         if audioWriterInput == nil {
+            guard !isWriting else { return }
             guard let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
                   let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return }
             let channels = Int(asbd.pointee.mChannelsPerFrame)

@@ -10,14 +10,17 @@ enum PhotoLibrarySaver {
     /// 将多个视频文件保存到系统相册
     /// - Parameters:
     ///   - urls: 本地视频文件路径（录制临时文件）
-    ///   - completion: (成功数, 失败数)，主线程回调
-    static func saveVideos(at urls: [URL], completion: @escaping (Int, Int) -> Void) {
+    ///   - completion: (保存成功的 URL 列表, 保存失败的 URL 列表)，主线程回调
+    /// 返回"哪些成功/哪些失败"而非仅计数，调用方可据此只删除成功文件、
+    /// 保留失败文件供用户手动找回（修复：保存失败后临时文件被误删）。
+    static func saveVideos(at urls: [URL],
+                           completion: @escaping (_ savedURLs: [URL], _ failedURLs: [URL]) -> Void) {
         guard !urls.isEmpty else {
-            completion(0, 0)
+            completion([], [])
             return
         }
-        var saved = 0
-        var failed = 0
+        var savedURLs: [URL] = []
+        var failedURLs: [URL] = []
         let counterQueue = DispatchQueue(label: "com.dualcamsync.photo-counter")
 
         let group = DispatchGroup()
@@ -28,14 +31,14 @@ enum PhotoLibrarySaver {
                 PHAssetChangeRequest.creationRequestForAssetFromVideo(atFileURL: url)
             }) { success, _ in
                 counterQueue.sync {
-                    if success { saved += 1 } else { failed += 1 }
+                    if success { savedURLs.append(url) } else { failedURLs.append(url) }
                 }
                 group.leave()
             }
         }
         group.notify(queue: .main) {
-            let resultSaved = counterQueue.sync { saved }
-            let resultFailed = counterQueue.sync { failed }
+            let resultSaved = counterQueue.sync { savedURLs }
+            let resultFailed = counterQueue.sync { failedURLs }
             completion(resultSaved, resultFailed)
         }
     }

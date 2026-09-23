@@ -16,15 +16,23 @@ struct SettingsPanel: View {
 
                 header
 
-                // 对焦 / 曝光锁定（每路独立，替代原预览角标上的锁）
+                // 对焦 / 曝光锁定（每路独立：对焦锁与曝光锁互不影响，可单独锁其一）
                 sectionTitle("对焦 / 曝光锁定")
                 ForEach(CameraSlot.allCases) { slot in
-                    Toggle("\(slot.displayName) 路 锁定 AE/AF", isOn: Binding(
-                        get: { camera.lockState[slot.index] },
-                        set: { camera.setLock($0, slot: slot) }
-                    ))
-                    .tint(.yellow)
-                    .disabled(camera.isRecording)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("\(slot.displayName) 路 对焦锁定", isOn: Binding(
+                            get: { camera.focusLockState[slot.index] },
+                            set: { camera.setFocusLock($0, slot: slot) }
+                        ))
+                        .tint(.yellow)
+                        .disabled(camera.isRecording)
+                        Toggle("\(slot.displayName) 路 曝光锁定", isOn: Binding(
+                            get: { camera.exposureLockState[slot.index] },
+                            set: { camera.setExposureLock($0, slot: slot) }
+                        ))
+                        .tint(.yellow)
+                        .disabled(camera.isRecording)
+                    }
                 }
 
                 // 杜比视界 HDR

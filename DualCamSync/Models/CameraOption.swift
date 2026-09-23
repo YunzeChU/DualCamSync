@@ -63,6 +63,7 @@ struct CameraOption: Identifiable, Hashable {
         switch device.deviceType {
         case .builtInUltraWideCamera:      type = .ultraWide
         case .builtInTelephotoCamera:      type = .telephoto
+        case .builtInTrueDepthCamera:      type = .front    // iPhone 前置（X 及以后）为 TrueDepth
         case .builtInWideAngleCamera where position == .front: type = .front
         default:                           type = .wide
         }
