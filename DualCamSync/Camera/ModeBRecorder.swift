@@ -21,11 +21,13 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     private let finishLock = NSLock()
     private var finishedCount = 0
     private var pendingError: Error?
+    /// 已成功完成录制的文件（一路失败时，另一路成功文件仍应保存到相册）
+    private var finishedSuccessURLs: [URL] = []
 
     /// 两路都录制完成（主线程回调）
     var onFinished: (([URL]) -> Void)?
-    /// 任一路失败（主线程回调）
-    var onError: ((Error) -> Void)?
+    /// 任一路失败（主线程回调）；附带另一路成功完成的文件 URL
+    var onError: ((Error, [URL]) -> Void)?
 
     var isRecording: Bool {
         outputA?.isRecording == true || outputB?.isRecording == true
@@ -55,6 +57,7 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         currentURLs = [urlA, urlB]
         finishedCount = 0
         pendingError = nil
+        finishedSuccessURLs = []
         outputA.startRecording(to: urlA, recordingDelegate: self)
         outputB.startRecording(to: urlB, recordingDelegate: self)
     }
@@ -74,16 +77,19 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         finishLock.lock()
         if let error, pendingError == nil {
             pendingError = error
+        } else if error == nil {
+            finishedSuccessURLs.append(outputFileURL)
         }
         finishedCount += 1
         let allDone = finishedCount >= 2
         let err = pendingError
+        let successURLs = finishedSuccessURLs
         finishLock.unlock()
 
         guard allDone else { return }
         DispatchQueue.main.async {
             if let err {
-                self.onError?(err)
+                self.onError?(err, successURLs)
             } else {
                 self.onFinished?(self.currentURLs)
             }

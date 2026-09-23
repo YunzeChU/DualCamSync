@@ -53,7 +53,11 @@ struct FunctionPanel: View {
             if expanded == key {
                 VStack(spacing: 2) {
                     ForEach(camera.availableCameras) { option in
-                        let usable = other.map { CameraPairProbe.shared.canUseTogether($0, option) } ?? true
+                        // 与另一路同设备、或组合探测不兼容 → 置灰
+                        let usable = other.map {
+                            $0.id != option.id
+                                && CameraPairProbe.shared.canUseTogether($0, option)
+                        } ?? true
                         let isCurrent = option.id == current?.id
                         optionRow(title: option.fullName,
                                   systemImage: option.systemImage,

@@ -200,14 +200,12 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: - 权限
 
     private func requestPermissions(completion: @escaping (Bool) -> Void) {
+        // 启动只依赖相机+麦克风；相册"写入"权限延迟到保存视频时再申请
+        // （需求：相册只申请写入权限，且不能因相册被拒而打不开预览）
         AVCaptureDevice.requestAccess(for: .video) { videoOK in
             AVCaptureDevice.requestAccess(for: .audio) { audioOK in
-                // 相册只申请"写入"权限（addOnly），不读取相册内容
-                PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
-                    let photoOK = (status == .authorized || status == .limited)
-                    DispatchQueue.main.async {
-                        completion(videoOK && audioOK && photoOK)
-                    }
+                DispatchQueue.main.async {
+                    completion(videoOK && audioOK)
                 }
             }
         }
@@ -370,8 +368,8 @@ final class CameraManager: NSObject, ObservableObject {
         modeBRecorder.onFinished = { [weak self] urls in
             self?.handleRecordingFinished(urls: urls)
         }
-        modeBRecorder.onError = { [weak self] err in
-            self?.handleRecordingFailed(err)
+        modeBRecorder.onError = { [weak self] err, successURLs in
+            self?.handleRecordingFailed(err, successURLs: successURLs)
         }
     }
 
@@ -611,6 +609,11 @@ final class CameraManager: NSObject, ObservableObject {
     func selectCamera(_ option: CameraOption, for slot: CameraSlot) {
         guard !isRecording else { return }
         let other = (slot == .a) ? cameraB : cameraA
+        // 不能与另一路选择同一台设备（同一输入无法同时挂两路）
+        if let other, option.id == other.id {
+            error = .comboUnsupported("\(option.fullName) 已用于另一路，请选择其他镜头")
+            return
+        }
         if let other, !CameraPairProbe.shared.canUseTogether(option, other) {
             error = .comboUnsupported("\(option.fullName) + \(other.fullName)")
             return
@@ -722,12 +725,15 @@ final class CameraManager: NSObject, ObservableObject {
         return isPortrait ? (base.height, base.width) : base
     }
 
-    /// 麦克风当前真实音频格式（采样率/声道数），供模式A提前创建 AAC 音轨
+    /// 麦克风音频格式（供模式A提前创建 AAC 音轨）
+    /// 采样率以设备 activeFormat 为准；声道数按需求**固定 2（立体声）**——
+    /// 依赖 activeFormat 的声道数不可靠（multichannelAudioMode 生效后
+    /// 实际采集声道可能与 activeFormat 不同），模式A需求即"固定立体声"。
     private func microphoneAudioFormat() -> (sampleRate: Double, channels: Int)? {
         guard let input = audioInput else { return nil }
         let fd = input.device.activeFormat.formatDescription
         guard let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd) else { return nil }
-        return (asbd.pointee.mSampleRate, Int(asbd.pointee.mChannelsPerFrame))
+        return (asbd.pointee.mSampleRate, 2)
     }
 
     /// 录制完成（主线程回调）：保存到相册 + 复位状态
@@ -754,10 +760,25 @@ final class CameraManager: NSObject, ObservableObject {
         }
     }
 
-    private func handleRecordingFailed(_ err: Error) {
+    /// 录制失败收尾：先保存一路可能已成功的文件，再上报错误
+    private func handleRecordingFailed(_ err: Error, successURLs: [URL] = []) {
         stopElapsedTimer()
         isRecording = false
         applyPendingDowngrade()
+        // 模式B一路失败、另一路成功：成功文件仍保存到相册（不丢弃）
+        if !successURLs.isEmpty {
+            PhotoLibrarySaver.saveVideos(at: successURLs) { [weak self] savedURLs, failedURLs in
+                guard let self else { return }
+                if failedURLs.isEmpty {
+                    self.showDegradationBanner("一路录制失败；成功的一段已保存到相册")
+                } else {
+                    self.showDegradationBanner("一路录制失败；成功的一段也未能保存，文件位于临时目录")
+                }
+                for url in savedURLs {
+                    try? FileManager.default.removeItem(at: url)
+                }
+            }
+        }
         error = (err as? CameraError) ?? .recordingFailed(err.localizedDescription)
     }
 
@@ -850,7 +871,9 @@ final class CameraManager: NSObject, ObservableObject {
         // 运行期错误 → 停止并提示
         NotificationCenter.default.addObserver(forName: AVCaptureSession.runtimeErrorNotification,
                                                object: nil, queue: .main) { [weak self] note in
-            if let err = note.userInfo?["AVCaptureSessionErrorKey"] as? AVError {
+            // userInfo 中的错误是 NSError（Swift 桥接 as? AVError 在部分系统下会失败），
+            // 统一按 NSError 读取，保证异常分支稳定。
+            if let err = note.userInfo?["AVCaptureSessionErrorKey"] as? NSError {
                 self?.handleRecordingFailed(err)
             }
         }

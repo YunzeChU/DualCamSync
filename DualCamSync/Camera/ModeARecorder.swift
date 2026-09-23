@@ -231,6 +231,13 @@ final class ModeARecorder: NSObject,
     }
 
     /// 视频回调：两路帧配对后合成一帧写入
+    /// -------------------------------------------------------------
+    /// 串行化设计（修复合成+写入并发）：
+    ///   - B 路（videoQueueB）：只更新配对缓冲，不做合成/写入；
+    ///   - A 路（videoQueueA）：独占"配对 → 清空缓冲 → 合成 → append"，
+    ///     保证 CIContext.render 与 AVAssetWriter append 永远只在单条
+    ///     串行队列上执行，不会并发。
+    ///   - 配对成功后立即清空 pendingA/B，防止旧帧被重复配对。
     private func handleVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer,
                                         connection: AVCaptureConnection) {
         guard isRecording,
@@ -240,18 +247,25 @@ final class ModeARecorder: NSObject,
         let isB = (connection === videoConnB)
         guard isA || isB else { return }
 
-        // 帧配对：两路都到齐且时间接近才合成
-        pairingLock.lock()
-        if isA {
-            pendingA = (pixelBuffer, pts)
-        } else {
+        // B 路：只写配对缓冲（加锁），让 A 路队列串行消费
+        if isB {
+            pairingLock.lock()
             pendingB = (pixelBuffer, pts)
+            pairingLock.unlock()
+            return
         }
+
+        // A 路：配对成功后消费缓冲并合成写入
+        pairingLock.lock()
+        pendingA = (pixelBuffer, pts)
         guard let a = pendingA, let b = pendingB,
               abs(a.pts.seconds - b.pts.seconds) < 0.1 else {
             pairingLock.unlock()
             return
         }
+        // 消费：清空配对缓冲，防止旧帧被重复配对
+        pendingA = nil
+        pendingB = nil
         let frameTime = a.pts
         let bufferA = a.buffer
         let bufferB = b.buffer
@@ -276,6 +290,15 @@ final class ModeARecorder: NSObject,
                                         connection: AVCaptureConnection) {
         guard isRecording, connection.inputPorts.first?.mediaType == .audio else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+
+        // 声道校验：writer 音轨按需求固定为双声道立体声（见 start 的
+        // audioFormat.channels=2）。若实际样本不是双声道（如设备立体声
+        // 模式未生效），直接丢弃该样本，避免 AVAssetWriter append 崩溃。
+        if let fd = CMSampleBufferGetFormatDescription(sampleBuffer),
+           let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(fd),
+           Int(asbd.pointee.mChannelsPerFrame) != 2 {
+            return
+        }
 
         // 兜底：正常路径 start() 已提前创建音轨；此分支仅在
         // "写入尚未开始且音轨未就绪"时按真实声道数尝试创建。

@@ -105,7 +105,7 @@ struct SettingsPanel: View {
             }
             .padding(18)
         }
-        .frame(width: 330, height: 560)
+        .frame(width: 330, maxHeight: 560)   // 限高：竖屏贴合 560，横屏受限父级自动 ≤ 屏高
         .glassPanel(cornerRadius: 32)
     }
 

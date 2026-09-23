@@ -82,6 +82,9 @@ struct CameraView: View {
         }
         .ignoresSafeArea()
         .preferredColorScheme(.dark)
+        // 录制中锁界面方向（开始方向），停止后恢复全部方向
+        .background(OrientationLockView(
+            lockedOrientation: camera.isRecording ? camera.interfaceOrientation : nil))
         .onAppear {
             UIDevice.current.beginGeneratingDeviceOrientationNotifications()
             camera.start()
