@@ -548,7 +548,7 @@ final class CameraManager: NSObject, ObservableObject {
     /// 若格式仍是 8-bit，成片即使带 dvhe 容器观感也是 SDR。
     private func applyHDRFormat() {
         for device in [cameraA?.device, cameraB?.device].compactMap({ $0 }) {
-            let dims = CMFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+            let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
             guard let hdr = findHDRFormat(for: device, width: dims.width, height: dims.height),
                   hdr != device.activeFormat else { continue }
             try? device.lockForConfiguration()
@@ -560,7 +560,7 @@ final class CameraManager: NSObject, ObservableObject {
     /// 查找与当前宽高匹配、且支持目标帧率的 10-bit HDR 格式
     private func findHDRFormat(for device: AVCaptureDevice,
                                width: Int32, height: Int32) -> AVCaptureDevice.Format? {
-        let targetFPS = Double(preset.maxFrameRate)
+        let targetFPS = Double(preset.fps)
         let targetVideoRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
         let targetFullRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
         for format in device.formats {
@@ -568,7 +568,7 @@ final class CameraManager: NSObject, ObservableObject {
             // HDR 视频 = 10-bit 双平面（VideoRange / FullRange）
             let subtype = UInt32(CMFormatDescriptionGetMediaSubType(desc))
             guard subtype == targetVideoRange || subtype == targetFullRange else { continue }
-            let dims = CMFormatDescriptionGetDimensions(desc)
+            let dims = CMVideoFormatDescriptionGetDimensions(desc)
             guard dims.width == width, dims.height == height else { continue }
             guard format.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= targetFPS - 0.5 }) else { continue }
             return format
