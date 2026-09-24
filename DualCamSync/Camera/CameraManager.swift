@@ -477,6 +477,7 @@ final class CameraManager: NSObject, ObservableObject {
         modeBRecorder.attach(outputA: outA, outputB: outB)
         // 录制完成/失败回调由 startRecording 按"收尾代际"统一设置
         // （attach 阶段不设：回调只在本轮录制触发，且需捕获当时的 token）
+    }
 
     /// 关闭 MovieFileOutput 上不属于指定镜头的视频连接（音频连接保持启用）
     private func constrainMovieOutput(_ output: AVCaptureMovieFileOutput, keep: CameraOption?) {
