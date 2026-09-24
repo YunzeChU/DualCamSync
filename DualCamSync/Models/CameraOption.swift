@@ -43,10 +43,10 @@ struct CameraOption: Identifiable, Hashable {
     /// 简短名称，如 "广角"
     var displayName: String { lensType.displayName }
 
-    /// 完整名称，如 "后置 广角"
+    /// 完整名称，如 "后置 广角"；前置无子类型，直接 "前置"
     var fullName: String {
         switch position {
-        case .front: return "前置 \(lensType.displayName)"
+        case .front: return "前置"
         default:     return "后置 \(lensType.displayName)"
         }
     }
