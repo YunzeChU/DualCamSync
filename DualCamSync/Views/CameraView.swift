@@ -326,23 +326,26 @@ struct CameraView: View {
     }
 
     /// 临时诊断横幅（真机定位：B 路预览失败原因 / 面板状态是否变化 / 录制状态是否变化）
+    /// 用 TimelineView 每秒刷新，避免异步配置完成后横幅仍显示初始快照。
     /// 每行格式固定，用户拍照/抄录后删除本视图。
     @ViewBuilder
     private func diagnosticBannerView() -> some View {
-        let status = camera.previewConnStatus
-        VStack(alignment: .leading, spacing: 2) {
-            Text("A:\(status.a) | B:\(status.b)")
-            Text("RUN:\(camera.isSessionRunning ? 1 : 0) REC:\(camera.isRecording ? 1 : 0) FIN:\(camera.isFinalizing ? 1 : 0)")
-            Text("LAY:\(camera.layout == .pictureInPicture ? "PIP" : "SPL") MOD:\(camera.mode == .dualFiles ? "B" : "A")")
-            Text("SET:\(showingSettings ? 1 : 0) FUN:\(showingFunction ? 1 : 0) GEN:\(camera.previewGeneration)")
+        TimelineView(.periodic(from: .now, by: 1)) { _ in
+            let status = camera.previewConnStatus
+            VStack(alignment: .leading, spacing: 2) {
+                Text("A:\(status.a) | B:\(status.b)")
+                Text("RUN:\(camera.isSessionRunning ? 1 : 0) REC:\(camera.isRecording ? 1 : 0) FIN:\(camera.isFinalizing ? 1 : 0)")
+                Text("LAY:\(camera.layout == .pictureInPicture ? "PIP" : "SPL") MOD:\(camera.mode == .dualFiles ? "B" : "A")")
+                Text("SET:\(showingSettings ? 1 : 0) FUN:\(showingFunction ? 1 : 0) GEN:\(camera.previewGeneration)")
+            }
+            .font(.system(size: 9, weight: .medium, design: .monospaced))
+            .foregroundStyle(.yellow)
+            .padding(5)
+            .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+            .padding(.top, 6)
+            .padding(.leading, 6)
+            .allowsHitTesting(false)
         }
-        .font(.system(size: 9, weight: .medium, design: .monospaced))
-        .foregroundStyle(.yellow)
-        .padding(5)
-        .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .padding(.top, 6)
-        .padding(.leading, 6)
-        .allowsHitTesting(false)
     }
 }
