@@ -70,11 +70,14 @@ struct CameraView: View {
                         )
                 }
 
-                // 降级/提示横幅
+    /// 降级/提示横幅
                 if let banner = camera.degradationBanner {
                     degradationBannerView(banner)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
+
+                // 临时诊断横幅（真机定位用，验证后删除）
+                diagnosticBannerView()
             }
             .animation(.spring(response: 0.38, dampingFraction: 0.85), value: showingFunction)
             .animation(.spring(response: 0.38, dampingFraction: 0.85), value: showingSettings)
@@ -320,5 +323,26 @@ struct CameraView: View {
     private func timeString(_ interval: TimeInterval) -> String {
         let total = Int(interval)
         return String(format: "%02d:%02d", total / 60, total % 60)
+    }
+
+    /// 临时诊断横幅（真机定位：B 路预览失败原因 / 面板状态是否变化 / 录制状态是否变化）
+    /// 每行格式固定，用户拍照/抄录后删除本视图。
+    @ViewBuilder
+    private func diagnosticBannerView() -> some View {
+        let status = camera.previewConnStatus
+        VStack(alignment: .leading, spacing: 2) {
+            Text("A:\(status.a) | B:\(status.b)")
+            Text("RUN:\(camera.isSessionRunning ? 1 : 0) REC:\(camera.isRecording ? 1 : 0) FIN:\(camera.isFinalizing ? 1 : 0)")
+            Text("LAY:\(camera.layout == .pictureInPicture ? "PIP" : "SPL") MOD:\(camera.mode == .dualFiles ? "B" : "A")")
+            Text("SET:\(showingSettings ? 1 : 0) FUN:\(showingFunction ? 1 : 0) GEN:\(camera.previewGeneration)")
+        }
+        .font(.system(size: 9, weight: .medium, design: .monospaced))
+        .foregroundStyle(.yellow)
+        .padding(5)
+        .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.top, 6)
+        .padding(.leading, 6)
+        .allowsHitTesting(false)
     }
 }

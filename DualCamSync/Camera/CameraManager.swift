@@ -404,6 +404,15 @@ final class CameraManager: NSObject, ObservableObject {
     /// 预览自愈重试计数（双摄首次配置时序问题，允许自动重配一次）
     private var previewRetryCount = 0
 
+    // MARK: - 诊断（临时：真机定位 B 路预览 / 面板展开 / 录制 UI 刷新问题）
+    /// 两路预览连接建立状态（含失败原因），供诊断横幅展示
+    var previewConnStatus: (a: String, b: String) {
+        (Self.describeFailure(previewConnA, lastFailure: lastPreviewFailureA),
+         Self.describeFailure(previewConnB, lastFailure: lastPreviewFailureB))
+    }
+    /// 会话是否正在运行（诊断用）
+    var isSessionRunning: Bool { session.isRunning }
+
     private static func describeFailure(_ conn: AVCaptureConnection?, lastFailure: String?) -> String {
         conn != nil ? "正常" : (lastFailure ?? "未知原因")
     }
