@@ -184,7 +184,8 @@ struct FunctionPanel: View {
     private var presetSection: some View {
         let key = "preset"
         return VStack(spacing: 4) {
-            sectionHeader(key: key, title: "分辨率 / 帧率", value: camera.preset.displayName) {
+            sectionHeader(key: key, title: "分辨率 / 帧率",
+                          value: "\(camera.preset.displayName) \(camera.preset.frameRateText)") {
                 withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) {
                     expanded = expanded == key ? nil : key
                 }
@@ -202,8 +203,7 @@ struct FunctionPanel: View {
                             HStack(spacing: 10) {
                                 Text(preset.displayName)
                                     .font(.system(size: 14, weight: .medium))
-                                    .frame(width: 22, alignment: .leading)
-                                Text("\(preset.fps) fps")
+                                Text(preset.frameRateText)
                                     .font(.system(size: 11))
                                     .foregroundStyle(.white.opacity(0.55))
                                 Spacer()

@@ -29,7 +29,7 @@ enum CameraError: LocalizedError {
         case .comboUnsupported(let names):
             return "该镜头组合（\(names)）在当前设备上无法同时开启"
         case .presetUnsupported(let preset):
-            return "所选镜头不支持 \(preset.displayName)"
+            return "所选镜头不支持 \(preset.displayName) \(preset.frameRateText)"
         case .dolbyUnavailable:
             return "杜比视界在当前镜头组合/规格下不可用"
         case .permissionDenied:

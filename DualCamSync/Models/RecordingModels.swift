@@ -10,7 +10,22 @@ enum ResolutionPreset: String, CaseIterable, Identifiable {
     case hd30  = "1080P30"
 
     var id: String { rawValue }
-    var displayName: String { rawValue }
+
+    /// 分辨率部分（不含帧率，帧率单独显示，避免 "1080P30" + "30 FPS" 重复）
+    var displayName: String {
+        switch self {
+        case .uhd30: return "4K"
+        case .hd60, .hd30: return "1080P"
+        }
+    }
+
+    /// 帧率文本（英文 FPS 写法）
+    var frameRateText: String {
+        switch self {
+        case .uhd30, .hd30: return "30 FPS"
+        case .hd60: return "60 FPS"
+        }
+    }
 
     /// 目标帧率
     var fps: Int {

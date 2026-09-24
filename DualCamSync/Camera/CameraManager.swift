@@ -737,7 +737,8 @@ final class CameraManager: NSObject, ObservableObject {
                 && CameraPairProbe.shared.supportsPreset(deviceB, $0)
         }) else { return }
         preset = fallback
-        showDegradationBanner("当前镜头组合不支持 \(old.displayName)，已自动降级到 \(fallback.displayName)")
+        showDegradationBanner("当前镜头组合不支持 \(old.displayName) \(old.frameRateText)，"
+                              + "已自动降级到 \(fallback.displayName) \(fallback.frameRateText)")
     }
 
     // MARK: - 对外设置方法（全部在非录制状态下生效）
