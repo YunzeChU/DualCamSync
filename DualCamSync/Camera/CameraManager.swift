@@ -5,6 +5,7 @@ import CoreVideo
 import Photos
 import SwiftUI
 import UIKit
+import Observation
 
 /// 相机管理器：整个双摄功能的唯一权威来源
 /// -------------------------------------------------------------
@@ -15,8 +16,12 @@ import UIKit
 ///  4. 异常容错：组合探测、自动降级、运行期错误兜底、高温/内存监控
 ///
 /// 线程模型：本类主要在主线程使用；AVFoundation 回调统一转回主队列后
-/// 再修改 @Published 状态，避免 SwiftUI 断言崩溃。
-final class CameraManager: NSObject, ObservableObject {
+/// 再修改可观察状态，避免 SwiftUI 断言崩溃。
+/// 使用 Observation 框架（iOS 26 推荐）：属性变化会直接驱动 SwiftUI 刷新。
+/// 注意：@Observable 宏不能作用于 NSObject 子类（Swift 硬性限制），
+/// 因此本类不继承 NSObject；CLLocationManagerDelegate 由内部辅助类承担。
+@Observable
+final class CameraManager {
     // MARK: - 会话与预览层
 
     /// 多摄会话（支持任意双镜头组合的核心）
@@ -30,7 +35,7 @@ final class CameraManager: NSObject, ObservableObject {
     private(set) var previewLayerA: AVCaptureVideoPreviewLayer!
     private(set) var previewLayerB: AVCaptureVideoPreviewLayer!
     /// 预览层代际号：每次重建预览层 +1，CameraView 用 .id 强制重建预览容器
-    @Published var previewGeneration = 0
+    var previewGeneration = 0
     private var previewConnA: AVCaptureConnection?
     private var previewConnB: AVCaptureConnection?
 
@@ -42,41 +47,41 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: - 对外状态（SwiftUI 驱动）
 
-    @Published var availableCameras: [CameraOption] = []
-    @Published var cameraA: CameraOption?
-    @Published var cameraB: CameraOption?
-    @Published var preset: ResolutionPreset = .uhd30
-    @Published var layout: PreviewLayout = .pictureInPicture   // 默认画中画
-    @Published var mode: RecordingMode = .dualFiles
-    @Published var dolbyVisionEnabled = false
-    @Published var spatialAudioEnabled = true
-    @Published var stabilizationEnabled = [true, true]
-    @Published var focusLockState = [false, false]      // 每路对焦锁定
-    @Published var exposureLockState = [false, false]   // 每路曝光锁定（与对焦独立）
-    @Published var exposureBias: [Float] = [0, 0]      // 每路曝光补偿
+    var availableCameras: [CameraOption] = []
+    var cameraA: CameraOption?
+    var cameraB: CameraOption?
+    var preset: ResolutionPreset = .uhd30
+    var layout: PreviewLayout = .pictureInPicture   // 默认画中画
+    var mode: RecordingMode = .dualFiles
+    var dolbyVisionEnabled = false
+    var spatialAudioEnabled = true
+    var stabilizationEnabled = [true, true]
+    var focusLockState = [false, false]      // 每路对焦锁定
+    var exposureLockState = [false, false]   // 每路曝光锁定（与对焦独立）
+    var exposureBias: [Float] = [0, 0]      // 每路曝光补偿
 
-    @Published var isRecording = false
+    var isRecording = false
     /// 成片收尾中（点停止后文件仍在异步写入/保存；期间禁止再次开始录制）
-    @Published var isFinalizing = false
+    var isFinalizing = false
     /// 收尾代际：每次 startRecording +1，录制器回调捕获当时的代际值。
     /// 防止"stopRecording 3 秒兜底复位 isFinalizing 后，用户已开始新录制，
     /// 而旧录制的 didFinish/finishWriting 回调迟到"时误停新录制/误复位状态。
     private var finalizeToken = 0
-    @Published var recordingElapsed: TimeInterval = 0
-    @Published var interfaceOrientation: UIInterfaceOrientation = .portrait
+    var recordingElapsed: TimeInterval = 0
+    var interfaceOrientation: UIInterfaceOrientation = .portrait
 
     /// 拍摄地点开关（保存视频时把定位写入视频元数据；需要定位权限）
     /// 默认关闭：不主动申请定位权限，只有用户打开开关并保存时才请求
-    @Published var includeLocation = false
+    var includeLocation = false
 
     /// 各档位在"当前双摄组合"下的可用性（UI 置灰用）
-    @Published var presetAvailability: [ResolutionPreset: Bool] = [:]
-    @Published var isDolbyVisionAvailable = false
-    @Published var isSpatialAudioAvailable = false
-    @Published var isMultiCamSupported = true
+    var presetAvailability: [ResolutionPreset: Bool] = [:]
+    var isDolbyVisionAvailable = false
+    var isSpatialAudioAvailable = false
+    var isMultiCamSupported = true
 
-    @Published var error: CameraError?
-    @Published var degradationBanner: String?
+    var error: CameraError?
+    var degradationBanner: String?
 
     var hasError: Bool {
         get { error != nil }
@@ -127,8 +132,30 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: - 定位（拍摄地点）
 
+    /// CLLocationManagerDelegate 辅助对象（CameraManager 不继承 NSObject，
+    /// @Observable 宏禁止作用于 NSObject 子类；delegate 回调转发回主对象）
+    private final class LocationDelegate: NSObject, CLLocationManagerDelegate {
+        weak var manager: CameraManager?
+        func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+            switch manager.authorizationStatus {
+            case .authorizedWhenInUse, .authorizedAlways:
+                // 授权后单次获取一个位置即可（拍摄地点不需要持续跟踪）
+                manager.requestLocation()
+            default:
+                break
+            }
+        }
+        func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+            self.manager?.lastLocation = locations.last
+        }
+        func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+            // 定位失败不阻塞录制与保存：视频正常保存，只是不带拍摄地点
+        }
+    }
+
     private let locationManager = CLLocationManager()
     private var lastLocation: CLLocation?
+    private let locationDelegate = LocationDelegate()
 
     /// 请求定位权限 + 单次获取位置。
     /// 只在"用户打开拍摄地点开关"或"保存时开关仍开且未授权"时调用，
@@ -136,7 +163,7 @@ final class CameraManager: NSObject, ObservableObject {
     private func requestLocationIfNeeded() {
         switch locationManager.authorizationStatus {
         case .notDetermined, .denied, .restricted:
-            locationManager.delegate = self
+            locationManager.delegate = locationDelegate
             // 拍摄地点不需要高精度，百米级即可，省电且无需高精度权限
             locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
             locationManager.requestWhenInUseAuthorization()
@@ -147,8 +174,9 @@ final class CameraManager: NSObject, ObservableObject {
 
     // MARK: - 初始化
 
-    override init() {
-        super.init()
+    init() {
+        locationDelegate.manager = self
+        locationManager.delegate = locationDelegate
         // 预览层在 init 中创建（session 为声明时初始化的 let，此处可安全访问）
         previewLayerA = Self.makePreviewLayer(session: session)
         previewLayerB = Self.makePreviewLayer(session: session)
@@ -283,15 +311,14 @@ final class CameraManager: NSObject, ObservableObject {
             try applyFormat(device: camB.device, preset: preset)
 
             // 预览层连接（手动建连）
-            // 首启直接用 init 里创建的预览层；仅在后续重配（存在旧连接残留风险）时
-            // 重建全新实例并递增 previewGeneration，触发 SwiftUI 换层。
+            // 每次重配都重建全新实例并递增 previewGeneration，触发 SwiftUI 换层。
             // 多摄经典坑：teardown 移除连接后，旧 previewLayer.connection 引用
-            // 未清干净，下一次 canAddConnection 可能失败 → 一路黑屏。
-            if previewGeneration > 0 {
-                previewLayerA = Self.makePreviewLayer(session: session)
-                previewLayerB = Self.makePreviewLayer(session: session)
-                previewGeneration += 1
-            }
+            // 未清干净，下一次 canAddConnection 可能失败 → 某一路黑屏。
+            // 因此不能只在 previewGeneration > 0 时重建（首启自愈重试时代际仍为 0，
+            // 会复用带残留 connection 的旧层，导致 B 路预览始终黑屏）。
+            previewLayerA = Self.makePreviewLayer(session: session)
+            previewLayerB = Self.makePreviewLayer(session: session)
+            previewGeneration += 1
             previewConnA = makePreviewConnection(layer: previewLayerA, input: inputA)
             previewConnB = makePreviewConnection(layer: previewLayerB, input: inputB)
 
@@ -1171,27 +1198,5 @@ final class CameraManager: NSObject, ObservableObject {
         for token in observationTokens {
             NotificationCenter.default.removeObserver(token)
         }
-    }
-}
-
-// MARK: - 定位（拍摄地点写入视频元数据）
-
-extension CameraManager: CLLocationManagerDelegate {
-    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
-        switch manager.authorizationStatus {
-        case .authorizedWhenInUse, .authorizedAlways:
-            // 授权后单次获取一个位置即可（拍摄地点不需要持续跟踪）
-            manager.requestLocation()
-        default:
-            break
-        }
-    }
-
-    func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
-        lastLocation = locations.last
-    }
-
-    func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        // 定位失败不阻塞录制与保存：视频正常保存，只是不带拍摄地点
     }
 }

@@ -16,13 +16,14 @@ import UIKit
 ///  3. 预览布局用稳定结构，旋转/切布局不重建容器（修复黑屏）；
 ///  4. 移除预览画面上的镜头角标（用户认为多余、占空间）。
 struct CameraView: View {
-    @StateObject private var camera = CameraManager()
+    @State private var camera = CameraManager()
     @Environment(\.scenePhase) private var scenePhase
 
     @State private var showingFunction = false
     @State private var showingSettings = false
 
     var body: some View {
+        @Bindable var camera = camera
         GeometryReader { geo in
             let isLandscape = geo.size.width > geo.size.height
             ZStack {
@@ -102,14 +103,17 @@ struct CameraView: View {
                 camera.stopRecording()
             }
         }
-        .alert("提示", isPresented: $camera.hasError, presenting: camera.error) { _ in
+        .alert("提示", isPresented: Binding(
+            get: { camera.error != nil },
+            set: { if !$0 { camera.error = nil } }
+        ), presenting: camera.error) { _ in
             Button("好") {}
         } message: { err in
             Text([err.errorDescription, err.recoverySuggestion]
                 .compactMap { $0 }
                 .joined(separator: "\n"))
         }
-        .environmentObject(camera)
+        .environment(camera)
     }
 
     /// 收起所有弹出面板（统一弹簧动画，保持原生手感）

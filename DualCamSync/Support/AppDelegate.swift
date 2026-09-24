@@ -31,6 +31,10 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     /// 锁定 / 解除界面方向；变更后主动触发系统重新查询
     /// 若新 mask 不含当前方向，UIKit 会自动把界面转回支持的方向。
     func applyOrientationLock(_ orientation: UIInterfaceOrientation?) {
+        // 值未变化时直接返回：避免 SwiftUI 每次 body 更新（录制期间 Timer 每 0.1s
+        // 更新 recordingElapsed）都触发 setNeedsUpdateOfSupportedInterfaceOrientations，
+        // 造成方向系统高频回调、干扰渲染。
+        guard lockedOrientation != orientation else { return }
         lockedOrientation = orientation
         UIApplication.shared.connectedScenes
             .compactMap { $0 as? UIWindowScene }

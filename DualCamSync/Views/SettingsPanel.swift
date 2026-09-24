@@ -8,7 +8,7 @@ import SwiftUI
 struct SettingsPanel: View {
     let onDismiss: () -> Void
 
-    @EnvironmentObject private var camera: CameraManager
+    @Environment(CameraManager.self) private var camera: CameraManager
 
     var body: some View {
         ScrollView(showsIndicators: false) {

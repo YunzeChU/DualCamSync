@@ -10,21 +10,20 @@ import SwiftUI
 extension View {
 
     /// 圆角玻璃面板（设置面板 / 选摄面板）
-    /// iOS 26 液态玻璃：玻璃背景形状由 `glassEffect(_:in:)` 的 `in:` 参数决定，
-    /// **默认是 Capsule（胶囊）**——内容越多越像药丸/椭圆，选项会超出玻璃背景。
-    /// 前两轮用 `.containerShape()` 想改形状是无效的：containerShape 只影响
-    /// 环境的容器形状（contentShape 等），**改不了 glassEffect 的玻璃背景**，
-    /// 这就是面板始终是药丸的根因。正确做法：直接把玻璃形状指定为圆角矩形。
-    /// 不再加 clipShape：玻璃背景即面板 frame，内容必然在背景内，无需裁剪。
+    /// 使用原生 `.glassEffect(.regular)` 保证在 iOS 26.6 上一定能渲染，
+    /// 再用 `.clipShape(RoundedRectangle)` 把玻璃背景裁成圆角矩形。
+    /// 不在 glassEffect 的 in: 中直接塞形状——部分 26.x 系统上该写法会导致
+    /// 面板整体不可见（用户反馈“点击后没有界面展开”）。
     func glassPanel(cornerRadius: CGFloat = 28) -> some View {
         self
-            .glassEffect(.regular, in: RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+            .glassEffect(.regular)
+            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 
     /// 玻璃胶囊（镜头角标 / 状态条）
     func glassCapsule() -> some View {
         self
-            .glassEffect(.regular, in: Capsule())
+            .glassEffect(.regular)
             .clipShape(Capsule())
     }
 
@@ -32,7 +31,7 @@ extension View {
     func glassCircle(size: CGFloat) -> some View {
         self
             .frame(width: size, height: size)
-            .glassEffect(.regular, in: Circle())
+            .glassEffect(.regular)
             .clipShape(Circle())
     }
 }
