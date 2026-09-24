@@ -24,7 +24,7 @@ extension View {
     /// 玻璃胶囊（镜头角标 / 状态条）
     func glassCapsule() -> some View {
         self
-            .glassEffect(.regular)
+            .glassEffect(.regular, in: Capsule())
             .clipShape(Capsule())
     }
 
@@ -32,7 +32,7 @@ extension View {
     func glassCircle(size: CGFloat) -> some View {
         self
             .frame(width: size, height: size)
-            .glassEffect(.regular)
+            .glassEffect(.regular, in: Circle())
             .clipShape(Circle())
     }
 }

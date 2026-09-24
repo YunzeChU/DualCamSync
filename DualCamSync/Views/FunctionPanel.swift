@@ -29,6 +29,13 @@ struct FunctionPanel: View {
                         .frame(maxWidth: .infinity, alignment: .center)
                         .padding(.top, 6)
                 }
+                if camera.isFinalizing {
+                    Text("正在保存视频：设置暂不可用")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.yellow.opacity(0.8))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(.top, 6)
+                }
             }
             .padding(16)
         }
@@ -112,8 +119,8 @@ struct FunctionPanel: View {
                                         in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                         }
                         .buttonStyle(.plain)
-                        .disabled(camera.isRecording)
-                        .opacity(camera.isRecording ? 0.35 : 1)
+                        .disabled(camera.isRecording || camera.isFinalizing)
+                        .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
                     }
                 }
                 .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
@@ -164,8 +171,8 @@ struct FunctionPanel: View {
                                         in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                         }
                         .buttonStyle(.plain)
-                        .disabled(camera.isRecording)
-                        .opacity(camera.isRecording ? 0.35 : 1)
+                        .disabled(camera.isRecording || camera.isFinalizing)
+                        .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
                     }
                 }
                 .transition(.opacity.combined(with: .scale(scale: 0.97, anchor: .top)))
@@ -213,7 +220,7 @@ struct FunctionPanel: View {
                                         in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                         }
                         .buttonStyle(.plain)
-                        .disabled(!available || camera.isRecording)
+                        .disabled(!available || camera.isRecording || camera.isFinalizing)
                         .opacity(available ? 1 : 0.35)
                     }
                 }

@@ -85,17 +85,17 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
                     didFinishRecordingTo outputFileURL: URL,
                     from connections: [AVCaptureConnection],
                     error: Error?) {
-        // 两路完成回调可能并发：先入队计数，回到主线程后再统一回调一次
+        // 两路完成回调可能并发：先入队计数，回到主线程后再统一回调一次。
+        // 注意：**锁内绝不调用 stopRecording**——若系统在极少数情况下同步
+        // 派发完成事件，会重入同一个 finishLock 造成死锁。
+        // 先记录"需要停止的另一路"，解锁后再 stop。
+        var otherToStop: AVCaptureMovieFileOutput?
         finishLock.lock()
         if let error, pendingError == nil {
             pendingError = error
             // 任一路启动/录制失败：立即停止另一路（若仍在录制），
             // 成功完成的一段仍会走保存逻辑（onError 携带 successURLs）
-            if output === outputA {
-                outputB?.stopRecording()
-            } else {
-                outputA?.stopRecording()
-            }
+            otherToStop = (output === outputA) ? outputB : outputA
         } else if error == nil {
             finishedSuccessURLs.append(outputFileURL)
         }
@@ -105,6 +105,7 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
         let successURLs = finishedSuccessURLs
         finishLock.unlock()
 
+        otherToStop?.stopRecording()
         guard allDone else { return }
         DispatchQueue.main.async {
             if let err {

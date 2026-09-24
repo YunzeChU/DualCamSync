@@ -163,9 +163,11 @@ struct CameraView: View {
 
     /// 单路预览：纯显示容器（不拦截触摸、无镜头角标）
     /// 预览层实例由 CameraManager 持有；重配后新 layer 经 previewGeneration
-    /// 触发更新，PreviewContainerView.didSet 负责摘旧层挂新层（同一容器换层）。
+    /// 触发更新：**.id(previewGeneration)** 强制 SwiftUI 重建容器，
+    /// PreviewContainerView.didSet 负责在同一容器内摘旧层挂新层（双保险）。
     private func previewSlot(_ slot: CameraSlot) -> some View {
         PreviewLayerView(layer: slot == .a ? camera.previewLayerA : camera.previewLayerB)
+            .id("preview-\(slot.id)-\(camera.previewGeneration)")
     }
 
     // MARK: 预览几何（分屏：A 占一半、B 占另一半；画中画：A 全屏、B 右下角）
@@ -216,8 +218,8 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
                     }
-                    .disabled(camera.isRecording)
-                    .opacity(camera.isRecording ? 0.35 : 1)
+                    .disabled(camera.isRecording || camera.isFinalizing)
+                    .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
                     Spacer()
                     ShutterButton(isRecording: camera.isRecording) {
                         camera.isRecording ? camera.stopRecording() : camera.startRecording()
@@ -226,8 +228,8 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
                     }
-                    .disabled(camera.isRecording)
-                    .opacity(camera.isRecording ? 0.35 : 1)
+                    .disabled(camera.isRecording || camera.isFinalizing)
+                    .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 28)
@@ -240,16 +242,16 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
                     }
-                    .disabled(camera.isRecording)
-                    .opacity(camera.isRecording ? 0.35 : 1)
+                    .disabled(camera.isRecording || camera.isFinalizing)
+                    .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
                     ShutterButton(isRecording: camera.isRecording) {
                         camera.isRecording ? camera.stopRecording() : camera.startRecording()
                     }
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
                     }
-                    .disabled(camera.isRecording)
-                    .opacity(camera.isRecording ? 0.35 : 1)
+                    .disabled(camera.isRecording || camera.isFinalizing)
+                    .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
                 }
                 .padding(.bottom, 46)
             }

@@ -62,7 +62,8 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var interfaceOrientation: UIInterfaceOrientation = .portrait
 
     /// 拍摄地点开关（保存视频时把定位写入视频元数据；需要定位权限）
-    @Published var includeLocation = true
+    /// 默认关闭：不主动申请定位权限，只有用户打开开关并保存时才请求
+    @Published var includeLocation = false
 
     /// 各档位在"当前双摄组合"下的可用性（UI 置灰用）
     @Published var presetAvailability: [ResolutionPreset: Bool] = [:]
@@ -125,12 +126,19 @@ final class CameraManager: NSObject, ObservableObject {
     private let locationManager = CLLocationManager()
     private var lastLocation: CLLocation?
 
-    /// 请求定位权限 + 单次获取位置（权限弹窗与应用启动同批出现，避免录制中打扰）
-    private func requestLocationPermission() {
-        locationManager.delegate = self
-        // 拍摄地点不需要高精度，百米级即可，省电且无需高精度权限
-        locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
-        locationManager.requestWhenInUseAuthorization()
+    /// 请求定位权限 + 单次获取位置。
+    /// 只在"用户打开拍摄地点开关"或"保存时开关仍开且未授权"时调用，
+    /// 不与应用启动同批弹窗（需求：权限延迟到保存场景，避免启动即打扰）。
+    private func requestLocationIfNeeded() {
+        switch locationManager.authorizationStatus {
+        case .notDetermined, .denied, .restricted:
+            locationManager.delegate = self
+            // 拍摄地点不需要高精度，百米级即可，省电且无需高精度权限
+            locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+            locationManager.requestWhenInUseAuthorization()
+        default:
+            break   // 已授权则直接用 lastLocation（可能为 nil 时视频不带定位）
+        }
     }
 
     // MARK: - 初始化
@@ -157,7 +165,6 @@ final class CameraManager: NSObject, ObservableObject {
             return
         }
 
-        requestLocationPermission()   // 定位权限与相机/麦克风权限同一批请求
         discoverCameras()
         if cameraA == nil || cameraB == nil { pickDefaultCameras() }
 
@@ -248,8 +255,9 @@ final class CameraManager: NSObject, ObservableObject {
         guard isMultiCamSupported,
               let camA = cameraA,
               let camB = cameraB else { return }
-        // 录制中不允许改动会话结构
-        guard !isRecording else { return }
+        // 录制中不允许改动会话结构；收尾中同样不允许（录制器还在异步写文件，
+        // 此刻 teardownSession 会拆掉会话导致最后一帧丢失/回调错乱）
+        guard !isRecording, !isFinalizing else { return }
 
         // 降级闭环：配置前先校验当前档位可用性，不可用先自动降级再配置，
         // 避免 applyFormat 直接抛错（需求：不支持的规格自动置灰/降级）
@@ -769,6 +777,12 @@ final class CameraManager: NSObject, ObservableObject {
         applyStabilization()
     }
 
+    /// 拍摄地点开关（打开时若未授权则立即请求一次定位权限）
+    func setIncludeLocation(_ on: Bool) {
+        includeLocation = on
+        if on { requestLocationIfNeeded() }
+    }
+
     /// 更换某路镜头（先做组合校验，不支持的组合直接拒绝并提示）
     func selectCamera(_ option: CameraOption, for slot: CameraSlot) {
         guard !isRecording else { return }
@@ -962,6 +976,7 @@ final class CameraManager: NSObject, ObservableObject {
         isFinalizing = false
         applyPendingDowngrade()   // 内存告警等触发的"录制结束后降级"在此闭环
         guard !urls.isEmpty else { return }
+        if includeLocation { requestLocationIfNeeded() }   // 保存场景才请求定位
         PhotoLibrarySaver.saveVideos(at: urls,
                                      location: includeLocation ? lastLocation : nil) { [weak self] savedURLs, failedURLs in
             guard let self else { return }
@@ -995,6 +1010,7 @@ final class CameraManager: NSObject, ObservableObject {
         applyPendingDowngrade()
         // 模式B一路失败、另一路成功：成功文件仍保存到相册（不丢弃）
         if !successURLs.isEmpty {
+            if includeLocation { requestLocationIfNeeded() }   // 保存场景才请求定位
             PhotoLibrarySaver.saveVideos(at: successURLs,
                                          location: includeLocation ? lastLocation : nil) { [weak self] savedURLs, savedFailed in
                 guard let self else { return }

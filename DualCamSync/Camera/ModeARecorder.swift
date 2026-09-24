@@ -1,6 +1,7 @@
 import AVFoundation
 import CoreMedia
 import Foundation
+import QuartzCore   // CACurrentMediaTime() 显式依赖（避免 SDK 间接导入差异）
 
 /// 模式A：合成单条录制器
 /// -------------------------------------------------------------

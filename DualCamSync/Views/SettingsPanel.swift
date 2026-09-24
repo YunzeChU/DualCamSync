@@ -25,13 +25,13 @@ struct SettingsPanel: View {
                             set: { camera.setFocusLock($0, slot: slot) }
                         ))
                         .tint(.yellow)
-                        .disabled(camera.isRecording)
+                        .disabled(camera.isRecording || camera.isFinalizing)
                         Toggle("\(slot.displayName) 路 曝光锁定", isOn: Binding(
                             get: { camera.exposureLockState[slot.index] },
                             set: { camera.setExposureLock($0, slot: slot) }
                         ))
                         .tint(.yellow)
-                        .disabled(camera.isRecording)
+                        .disabled(camera.isRecording || camera.isFinalizing)
                     }
                 }
 
@@ -43,7 +43,8 @@ struct SettingsPanel: View {
                 .tint(.yellow)
                 .disabled(!camera.isDolbyVisionAvailable
                           || camera.mode == .composite
-                          || camera.isRecording)
+                          || camera.isRecording
+                          || camera.isFinalizing)
                 .opacity((camera.isDolbyVisionAvailable && camera.mode == .dualFiles) ? 1 : 0.35)
                 if camera.mode == .composite {
                     hint("仅双文件模式支持杜比视界 HDR；合成模式为保证兼容使用普通 HEVC")
@@ -61,7 +62,8 @@ struct SettingsPanel: View {
                 .tint(.yellow)
                 .disabled(!camera.isSpatialAudioAvailable
                           || camera.mode == .composite
-                          || camera.isRecording)
+                          || camera.isRecording
+                          || camera.isFinalizing)
                 .opacity((camera.isSpatialAudioAvailable && camera.mode == .dualFiles) ? 1 : 0.35)
                 if camera.mode == .composite {
                     hint("仅双文件模式支持空间音频；合成模式为保证兼容，使用立体声")
@@ -77,16 +79,16 @@ struct SettingsPanel: View {
                         set: { camera.setStabilization($0, slot: slot) }
                     ))
                     .tint(.yellow)
-                    .disabled(camera.isRecording)
+                    .disabled(camera.isRecording || camera.isFinalizing)
                 }
 
                 // 拍摄地点（保存时写入视频元数据，需要定位权限）
                 Toggle("拍摄地点 (写入视频)", isOn: Binding(
                     get: { camera.includeLocation },
-                    set: { camera.includeLocation = $0 }
+                    set: { camera.setIncludeLocation($0) }
                 ))
                 .tint(.yellow)
-                .disabled(camera.isRecording)
+                .disabled(camera.isRecording || camera.isFinalizing)
                 hint("保存视频时把拍摄地点写入视频元数据；未授权定位则不写入")
 
                 // 曝光补偿
@@ -100,13 +102,19 @@ struct SettingsPanel: View {
                             set: { camera.setExposureBias($0, slot: slot) }
                         ), in: camera.exposureBiasRange(for: slot))
                         .tint(.yellow)
-                        .disabled(camera.isRecording)
+                        .disabled(camera.isRecording || camera.isFinalizing)
                     }
                 }
 
                 // 录制中不可修改提示
                 if camera.isRecording {
                     Text("录制中：设置已锁定")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.yellow.opacity(0.8))
+                        .frame(maxWidth: .infinity, alignment: .center)
+                }
+                if camera.isFinalizing {
+                    Text("正在保存视频：设置暂不可用")
                         .font(.system(size: 11))
                         .foregroundStyle(.yellow.opacity(0.8))
                         .frame(maxWidth: .infinity, alignment: .center)
