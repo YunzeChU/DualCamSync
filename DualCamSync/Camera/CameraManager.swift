@@ -313,6 +313,16 @@ final class CameraManager: NSObject, ObservableObject {
                 error = .configurationFailed(
                     "预览层建立失败（A 路\(Self.describeFailure(previewConnA, lastFailure: lastPreviewFailureA))、"
                     + "B 路\(Self.describeFailure(previewConnB, lastFailure: lastPreviewFailureB))）")
+                // 自愈：双摄首次配置存在系统时序问题，延迟重配一次通常可恢复双路；
+                // 有次数上限，避免无限重试。
+                if previewRetryCount < 1 {
+                    previewRetryCount += 1
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                        self?.applyConfiguration()
+                    }
+                }
+            } else {
+                previewRetryCount = 0
             }
         } catch {
             session.commitConfiguration()
@@ -343,6 +353,9 @@ final class CameraManager: NSObject, ObservableObject {
     /// 手动创建预览层连接（多摄会话禁止自动建连）
     /// 失败时记录具体原因（lastPreviewFailure*），错误提示区分
     /// "端口缺失"与"会话拒绝建连"两种情形，便于真机定位。
+    /// 端口策略：**遍历该输入的全部视频端口逐个尝试**——
+    /// 部分镜头（如超广角）的输入可能含辅助/虚拟视频端口，
+    /// 用 first(where:) 选中它们时 canAddConnection 会拒绝 → 一路黑屏。
     private func makePreviewConnection(layer: AVCaptureVideoPreviewLayer,
                                        input: AVCaptureDeviceInput) -> AVCaptureConnection? {
         // 防御：若 layer 已存在连接（某些系统版本在 addInput 时可能
@@ -350,25 +363,33 @@ final class CameraManager: NSObject, ObservableObject {
         if let existing = layer.connection {
             return existing
         }
-        guard let port = input.ports.first(where: { $0.mediaType == .video }) else {
+        let videoPorts = input.ports.filter { $0.mediaType == .video }
+        guard !videoPorts.isEmpty else {
             if layer === previewLayerA { lastPreviewFailureA = "端口缺失" } else { lastPreviewFailureB = "端口缺失" }
             return nil
         }
-        let conn = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
-        guard session.canAddConnection(conn) else {
-            if layer === previewLayerA { lastPreviewFailureA = "会话拒绝建连" } else { lastPreviewFailureB = "会话拒绝建连" }
-            return nil
+        for port in videoPorts {
+            let conn = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
+            guard session.canAddConnection(conn) else { continue }
+            // 前置不镜像（需求：前置摄像头不允许镜像）
+            conn.automaticallyAdjustsVideoMirroring = false
+            conn.isVideoMirrored = false
+            session.addConnection(conn)
+            if layer === previewLayerA { lastPreviewFailureA = nil } else { lastPreviewFailureB = nil }
+            return conn
         }
-        // 前置不镜像（需求：前置摄像头不允许镜像）
-        conn.automaticallyAdjustsVideoMirroring = false
-        conn.isVideoMirrored = false
-        session.addConnection(conn)
-        if layer === previewLayerA { lastPreviewFailureA = nil } else { lastPreviewFailureB = nil }
-        return conn
+        if layer === previewLayerA {
+            lastPreviewFailureA = "会话拒绝建连（\(videoPorts.count) 个视频端口均被拒）"
+        } else {
+            lastPreviewFailureB = "会话拒绝建连（\(videoPorts.count) 个视频端口均被拒）"
+        }
+        return nil
     }
 
     private var lastPreviewFailureA: String?
     private var lastPreviewFailureB: String?
+    /// 预览自愈重试计数（双摄首次配置时序问题，允许自动重配一次）
+    private var previewRetryCount = 0
 
     private static func describeFailure(_ conn: AVCaptureConnection?, lastFailure: String?) -> String {
         conn != nil ? "正常" : (lastFailure ?? "未知原因")
@@ -886,6 +907,9 @@ final class CameraManager: NSObject, ObservableObject {
     /// 停止录制（保存由录制器回调统一触发）
     /// 点按立即复位 UI（按钮/计时），成片由录制器异步收尾并保存——
     /// 修复"点停止后要空等约 1 秒才终止"的卡顿感。
+    /// 兜底：收尾回调（didFinishRecordingTo / finishWriting）异常丢失时
+    /// 3 秒后强制复位 isFinalizing，避免"上一段视频正在保存"永久卡死
+    /// （isFinalizing 卡死会把录制键、功能/设置键全部禁用 = "设置栏打不开"）。
     func stopRecording() {
         guard isRecording else { return }
         isFinalizing = true
@@ -894,6 +918,10 @@ final class CameraManager: NSObject, ObservableObject {
         switch mode {
         case .dualFiles: modeBRecorder.stop()
         case .composite: modeARecorder.stop()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.isFinalizing else { return }
+            self.isFinalizing = false
         }
     }
 

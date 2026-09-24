@@ -54,7 +54,14 @@ final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
     /// 因此"双输出启动校验"由 fileOutput 完成回调统一处理：
     /// 任一路报错立即停止另一路（避免一路失败另一路空录）。
     func start() throws {
-        guard let outputA, let outputB, !outputA.isRecording, !outputB.isRecording else { return }
+        guard let outputA, let outputB else {
+            // 静默返回 = 录制键点了毫无反应（用户反复反馈"录制键没有变化"）。
+            // 必须抛错给上层弹窗说明原因。
+            throw CameraError.recordingFailed("录制输出未就绪，请重新选择镜头组合")
+        }
+        guard !outputA.isRecording, !outputB.isRecording else {
+            throw CameraError.recordingFailed("上一段视频仍在收尾，请稍候")
+        }
         let dir = FileManager.default.temporaryDirectory
         let stamp = Int(Date().timeIntervalSince1970 * 1000)
         let urlA = dir.appendingPathComponent("DCS_\(stamp)_A.mp4")

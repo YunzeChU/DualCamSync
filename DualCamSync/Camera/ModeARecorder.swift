@@ -103,7 +103,10 @@ final class ModeARecorder: NSObject,
     func start(outputSize: (width: Int32, height: Int32),
                layout: PreviewLayout,
                audioFormat: (sampleRate: Double, channels: Int)?) throws {
-        guard !isRecording else { return }
+        guard !isRecording else {
+            // 静默返回 = 录制键点了毫无反应；必须抛错让上层弹窗说明
+            throw CameraError.recordingFailed("上一段视频仍在收尾，请稍候")
+        }
         guard manager != nil else {
             throw CameraError.configurationFailed("录制器未就绪")
         }
