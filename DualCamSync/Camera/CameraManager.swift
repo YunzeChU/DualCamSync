@@ -58,6 +58,10 @@ final class CameraManager: NSObject, ObservableObject {
     @Published var isRecording = false
     /// 成片收尾中（点停止后文件仍在异步写入/保存；期间禁止再次开始录制）
     @Published var isFinalizing = false
+    /// 收尾代际：每次 startRecording +1，录制器回调捕获当时的代际值。
+    /// 防止"stopRecording 3 秒兜底复位 isFinalizing 后，用户已开始新录制，
+    /// 而旧录制的 didFinish/finishWriting 回调迟到"时误停新录制/误复位状态。
+    private var finalizeToken = 0
     @Published var recordingElapsed: TimeInterval = 0
     @Published var interfaceOrientation: UIInterfaceOrientation = .portrait
 
@@ -314,20 +318,21 @@ final class CameraManager: NSObject, ObservableObject {
             applyHDRFormatIfNeeded()
 
             // 预览连接建立失败不能静默：双摄预览只有一路，用户无法发现。
-            // 细化到 A/B 哪一路失败、失败原因，便于定位。
+            // 自愈：双摄首次配置存在系统时序问题，延迟重配一次通常可恢复双路；
+            // 有次数上限。**首次失败不立即弹错**：若重试成功则不打扰用户，
+            // 重试仍失败才上报（避免 alert 残留 + 实际已恢复的矛盾状态）。
             let aOK = previewConnA != nil
             let bOK = previewConnB != nil
             if !aOK || !bOK {
-                error = .configurationFailed(
-                    "预览层建立失败（A 路\(Self.describeFailure(previewConnA, lastFailure: lastPreviewFailureA))、"
-                    + "B 路\(Self.describeFailure(previewConnB, lastFailure: lastPreviewFailureB))）")
-                // 自愈：双摄首次配置存在系统时序问题，延迟重配一次通常可恢复双路；
-                // 有次数上限，避免无限重试。
                 if previewRetryCount < 1 {
                     previewRetryCount += 1
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                         self?.applyConfiguration()
                     }
+                } else {
+                    error = .configurationFailed(
+                        "预览层建立失败（A 路\(Self.describeFailure(previewConnA, lastFailure: lastPreviewFailureA))、"
+                        + "B 路\(Self.describeFailure(previewConnB, lastFailure: lastPreviewFailureB))）")
                 }
             } else {
                 previewRetryCount = 0
@@ -470,13 +475,8 @@ final class CameraManager: NSObject, ObservableObject {
         constrainMovieOutput(outB, keep: cameraB)
 
         modeBRecorder.attach(outputA: outA, outputB: outB)
-        modeBRecorder.onFinished = { [weak self] urls in
-            self?.handleRecordingFinished(urls: urls)
-        }
-        modeBRecorder.onError = { [weak self] err, successURLs, failedURLs in
-            self?.handleRecordingFailed(err, successURLs: successURLs, failedURLs: failedURLs)
-        }
-    }
+        // 录制完成/失败回调由 startRecording 按"收尾代际"统一设置
+        // （attach 阶段不设：回调只在本轮录制触发，且需捕获当时的 token）
 
     /// 关闭 MovieFileOutput 上不属于指定镜头的视频连接（音频连接保持启用）
     private func constrainMovieOutput(_ output: AVCaptureMovieFileOutput, keep: CameraOption?) {
@@ -531,12 +531,7 @@ final class CameraManager: NSObject, ObservableObject {
         modeARecorder.attach(videoOutputA: outA, videoOutputB: outB,
                              audioOutput: outAudio,
                              connA: compositeVideoConnA, connB: compositeVideoConnB)
-        modeARecorder.onFinished = { [weak self] urls in
-            self?.handleRecordingFinished(urls: urls)
-        }
-        modeARecorder.onError = { [weak self] err in
-            self?.handleRecordingFailed(err)
-        }
+        // 录制完成/失败回调由 startRecording 按"收尾代际"统一设置
     }
 
     private func constrainDataOutput(_ output: AVCaptureVideoDataOutput,
@@ -744,36 +739,36 @@ final class CameraManager: NSObject, ObservableObject {
     // MARK: - 对外设置方法（全部在非录制状态下生效）
 
     func setPreset(_ newValue: ResolutionPreset) {
-        guard !isRecording, preset != newValue else { return }
+        guard !isRecording, !isFinalizing, preset != newValue else { return }
         preset = newValue
         applyConfiguration()
     }
 
     func setLayout(_ newValue: PreviewLayout) {
-        guard !isRecording, layout != newValue else { return }
+        guard !isRecording, !isFinalizing, layout != newValue else { return }
         layout = newValue
     }
 
     func setMode(_ newValue: RecordingMode) {
-        guard !isRecording, mode != newValue else { return }
+        guard !isRecording, !isFinalizing, mode != newValue else { return }
         mode = newValue
         applyConfiguration()
     }
 
     func setDolbyVision(_ enabled: Bool) {
-        guard !isRecording, dolbyVisionEnabled != enabled else { return }
+        guard !isRecording, !isFinalizing, dolbyVisionEnabled != enabled else { return }
         dolbyVisionEnabled = enabled
         applyConfiguration()
     }
 
     func setSpatialAudio(_ enabled: Bool) {
-        guard !isRecording, spatialAudioEnabled != enabled else { return }
+        guard !isRecording, !isFinalizing, spatialAudioEnabled != enabled else { return }
         spatialAudioEnabled = enabled
         applyConfiguration()
     }
 
     func setStabilization(_ enabled: Bool, slot: CameraSlot) {
-        guard !isRecording, stabilizationEnabled[slot.index] != enabled else { return }
+        guard !isRecording, !isFinalizing, stabilizationEnabled[slot.index] != enabled else { return }
         stabilizationEnabled[slot.index] = enabled
         applyStabilization()
     }
@@ -786,7 +781,7 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// 更换某路镜头（先做组合校验，不支持的组合直接拒绝并提示）
     func selectCamera(_ option: CameraOption, for slot: CameraSlot) {
-        guard !isRecording else { return }
+        guard !isRecording, !isFinalizing else { return }
         let other = (slot == .a) ? cameraB : cameraA
         // 不能与另一路选择同一台设备（同一输入无法同时挂两路）
         if let other, option.id == other.id {
@@ -849,14 +844,14 @@ final class CameraManager: NSObject, ObservableObject {
 
     /// 设置面板用：锁定/解锁该路对焦（不影响曝光）
     func setFocusLock(_ locked: Bool, slot: CameraSlot) {
-        guard !isRecording, focusLockState[slot.index] != locked else { return }
+        guard !isRecording, !isFinalizing, focusLockState[slot.index] != locked else { return }
         focusLockState[slot.index] = locked
         applyLock(slot: slot)
     }
 
     /// 设置面板用：锁定/解锁该路曝光（不影响对焦）
     func setExposureLock(_ locked: Bool, slot: CameraSlot) {
-        guard !isRecording, exposureLockState[slot.index] != locked else { return }
+        guard !isRecording, !isFinalizing, exposureLockState[slot.index] != locked else { return }
         exposureLockState[slot.index] = locked
         applyLock(slot: slot)
     }
@@ -903,14 +898,30 @@ final class CameraManager: NSObject, ObservableObject {
             applyOrientation()
             // 两路连接的方向已在上面锁定，录制起点即当前方向；
             // 录制期间不再跟随旋转（成片方向固定）。
+            // 新代际：本次录制的回调只认当前 token（迟到旧回调一律忽略）
+            finalizeToken += 1
+            let token = finalizeToken
             switch mode {
             case .dualFiles:
                 try modeBRecorder.start()
+                modeBRecorder.onFinished = { [weak self] urls in
+                    self?.handleRecordingFinished(urls: urls, token: token)
+                }
+                modeBRecorder.onError = { [weak self] err, successURLs, failedURLs in
+                    self?.handleRecordingFailed(err, successURLs: successURLs,
+                                                failedURLs: failedURLs, token: token)
+                }
             case .composite:
                 let target = targetOutputDimensions()
                 try modeARecorder.start(outputSize: target,
                                         layout: layout,
                                         audioFormat: microphoneAudioFormat())
+                modeARecorder.onFinished = { [weak self] urls in
+                    self?.handleRecordingFinished(urls: urls, token: token)
+                }
+                modeARecorder.onError = { [weak self] err in
+                    self?.handleRecordingFailed(err, token: token)
+                }
             }
             isRecording = true
             startElapsedTimer()
@@ -971,7 +982,10 @@ final class CameraManager: NSObject, ObservableObject {
     }
 
     /// 录制完成（主线程回调）：保存到相册 + 复位状态
-    private func handleRecordingFinished(urls: [URL]) {
+    /// - Parameter token: 录制代际；不等于当前 finalizeToken 的迟到回调直接忽略
+    ///   （防"超时兜底复位后旧回调到达"破坏新录制状态机）
+    private func handleRecordingFinished(urls: [URL], token: Int) {
+        guard token == finalizeToken else { return }
         stopElapsedTimer()
         isRecording = false
         isFinalizing = false
@@ -1004,7 +1018,11 @@ final class CameraManager: NSObject, ObservableObject {
     ///     系统 tmp 目录会在适当时候自动回收，不手动删除防误删）
     private func handleRecordingFailed(_ err: Error,
                                        successURLs: [URL] = [],
-                                       failedURLs: [URL] = []) {
+                                       failedURLs: [URL] = [],
+                                       token: Int? = nil) {
+        // 录制器回调带代际：不等于当前 finalizeToken 的迟到回调忽略；
+        // runtimeError 通知等系统事件不带 token（token = nil）总是处理。
+        if let token, token != finalizeToken { return }
         stopElapsedTimer()
         isRecording = false
         isFinalizing = false
