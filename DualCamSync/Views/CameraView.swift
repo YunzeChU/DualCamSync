@@ -2,6 +2,21 @@ import AVFoundation
 import SwiftUI
 import UIKit
 
+/// CameraView 的 UI 状态容器。
+/// 修复：iOS 26.6.1 真机上，普通 @State 变化（ui.showingFunction / ui.pipOffset）
+/// 在初始态**不触发子树重算**（实测：点功能键 FUN 保持 0、面板不展开；
+/// 拖动小窗 ui.pipOffset 已写入但画面不动；第一次点录制键触发 isRecording
+/// 刷新后一切"一次性补上"）。而 @State 包装的 @Observable 属性变化
+/// **可靠触发刷新**（camera.isRecording 从始至终正常）。因此 UI 状态
+/// 全部迁入 @Observable，走已验证可靠的刷新通道。
+@Observable
+final class CameraUIState {
+    var showingFunction = false
+    var showingSettings = false
+    var pipOffset = CGSize.zero
+    var pipDragOffset = CGSize.zero
+}
+
 /// 主界面：双摄预览 + 液态玻璃控制层
 /// -------------------------------------------------------------
 /// 结构仿 iPhone 原生相机（竖屏底部三键 / 横屏右侧三键）：
@@ -19,11 +34,9 @@ struct CameraView: View {
     @State private var camera = CameraManager()
     @Environment(\.scenePhase) private var scenePhase
 
-    @State private var showingFunction = false
-    @State private var showingSettings = false
-    /// 画中画小窗拖动偏移（@State：旋转/切布局后保留，越界时 clamp）
-    @State private var pipOffset = CGSize.zero
-    @State private var pipDragOffset = CGSize.zero
+    /// UI 状态（@Observable 通道：iOS 26.6.1 真机普通 @State 不触发刷新，
+    /// 见 CameraUIState 注释；面板开关与小窗位置必须走可靠通道）
+    @State private var ui = CameraUIState()
 
     var body: some View {
         @Bindable var camera = camera
@@ -42,7 +55,7 @@ struct CameraView: View {
                 recordingTimerView()
 
                 // 功能面板（液态玻璃二级菜单，从功能键所在侧弹出）
-                if showingFunction {
+                if ui.showingFunction {
                     overlayDim()
                         .onTapGesture { dismissAllPanels() }
                         .zIndex(9)
@@ -60,7 +73,7 @@ struct CameraView: View {
                 }
 
                 // 设置面板（液态玻璃弹层，从设置键所在侧弹出）
-                if showingSettings {
+                if ui.showingSettings {
                     overlayDim()
                         .onTapGesture { dismissAllPanels() }
                         .zIndex(9)
@@ -81,8 +94,8 @@ struct CameraView: View {
                 // 临时诊断横幅（真机定位用，验证后删除）
                 diagnosticBannerView()
             }
-            .animation(.spring(response: 0.38, dampingFraction: 0.85), value: showingFunction)
-            .animation(.spring(response: 0.38, dampingFraction: 0.85), value: showingSettings)
+            .animation(.spring(response: 0.38, dampingFraction: 0.85), value: ui.showingFunction)
+            .animation(.spring(response: 0.38, dampingFraction: 0.85), value: ui.showingSettings)
             .animation(.snappy, value: camera.degradationBanner)
         }
         .ignoresSafeArea()
@@ -131,8 +144,8 @@ struct CameraView: View {
     /// 收起所有弹出面板（统一弹簧动画，保持原生手感）
     private func dismissAllPanels() {
         withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
-            showingFunction = false
-            showingSettings = false
+            ui.showingFunction = false
+            ui.showingSettings = false
         }
     }
 
@@ -163,7 +176,7 @@ struct CameraView: View {
     /// 手动 offset 在旋转完成后的几何重算中会把 B 推出显示区域
     /// （真机实测：分屏横屏旋转后 B 跑到屏幕外）。
     /// 画中画小窗：尺寸参考苹果原生相机（宽约屏宽 26%、高按画面比例），
-    /// 可拖动（@State pipOffset 记忆位置，越界 clamp 回屏内）。
+    /// 可拖动（@State ui.pipOffset 记忆位置，越界 clamp 回屏内）。
     @ViewBuilder
     private func previewArea(geo: GeometryProxy, isLandscape: Bool) -> some View {
         ZStack {
@@ -195,21 +208,21 @@ struct CameraView: View {
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                 .shadow(color: .black.opacity(0.25), radius: 9, x: 0, y: 3)
                 .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .offset(x: pipOffset.width + pipDragOffset.width,
-                        y: pipOffset.height + pipDragOffset.height)
+                .offset(x: ui.pipOffset.width + ui.pipDragOffset.width,
+                        y: ui.pipOffset.height + ui.pipDragOffset.height)
                 .padding(20)
                 .gesture(
                     // 录制中禁用拖动：成片小窗位置 = 录制开始位置（拍后固定）
                     camera.isRecording ? nil :
                     DragGesture()
                         .onChanged { value in
-                            pipDragOffset = value.translation
+                            ui.pipDragOffset = value.translation
                         }
                         .onEnded { value in
-                            pipOffset = CGSize(
-                                width: pipOffset.width + value.translation.width,
-                                height: pipOffset.height + value.translation.height)
-                            pipDragOffset = .zero
+                            ui.pipOffset = CGSize(
+                                width: ui.pipOffset.width + value.translation.width,
+                                height: ui.pipOffset.height + value.translation.height)
+                            ui.pipDragOffset = .zero
                             clampPipOffset(to: geo.size, window: pipSize, isLandscape: isLandscape)
                         }
                 )
@@ -240,7 +253,7 @@ struct CameraView: View {
                 // 旋转后先清零拖动残留，再按新屏幕尺寸重新 clamp，
                 // 保证小窗必然回到屏内（用户实测：首次竖→横旋转时小窗会
                 // 跑到屏幕外，正是残留/旧基准未重算的表现）
-                pipDragOffset = .zero
+                ui.pipDragOffset = .zero
                 clampPipOffset(to: geo.size, window: pipWindowSize(geo, isLandscape),
                                isLandscape: isLandscape)
             }
@@ -258,15 +271,15 @@ struct CameraView: View {
 
     /// 计算小窗当前的归一化中心位置（0~1，y 从顶部算，与 SwiftUI 一致）。
     /// 基准 = 默认避让位置（与 previewArea 的 padding、clampPipOffset 同一套
-    /// 常量），叠加拖动偏移 pipOffset；录制开始前由 controlOverlay 写入
+    /// 常量），叠加拖动偏移 ui.pipOffset；录制开始前由 controlOverlay 写入
     /// camera.pipPosition，模式A合成时 makePiP 按此摆放成片小窗。
     private func currentPipNormalizedPosition(geo: GeometryProxy, isLandscape: Bool) -> CGPoint {
         let size = geo.size
         let window = pipWindowSize(geo, isLandscape)
         let baseX = size.width - window.width - (isLandscape ? 200 : 24)
         let baseY = size.height - window.height - (isLandscape ? 24 : 190)
-        let centerX = baseX + pipOffset.width + window.width / 2
-        let centerY = baseY + pipOffset.height + window.height / 2
+        let centerX = baseX + ui.pipOffset.width + window.width / 2
+        let centerY = baseY + ui.pipOffset.height + window.height / 2
         return CGPoint(x: centerX / size.width, y: centerY / size.height)
     }
 
@@ -281,8 +294,8 @@ struct CameraView: View {
         let maxOX = (size.width - window.width - 8) - baseX
         let minOY = 8 - baseY
         let maxOY = (size.height - window.height - 8) - baseY
-        pipOffset.width = min(max(pipOffset.width, minOX), maxOX)
-        pipOffset.height = min(max(pipOffset.height, minOY), maxOY)
+        ui.pipOffset.width = min(max(ui.pipOffset.width, minOX), maxOX)
+        ui.pipOffset.height = min(max(ui.pipOffset.height, minOY), maxOY)
     }
 
     /// 单路预览：纯显示容器（不拦截触摸、无镜头角标）
@@ -316,7 +329,7 @@ struct CameraView: View {
                 Spacer()
                 VStack(spacing: 30) {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
-                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { ui.showingFunction = true }
                     }
                     // 按钮层**不禁用也不设 allowsHitTesting**：容器一旦
                     // .allowsHitTesting(false) 会连子树一起禁用，子按钮的
@@ -335,7 +348,7 @@ struct CameraView: View {
                     }
                     Spacer()
                     GlassIconButton(systemImage: "gearshape.fill") {
-                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { ui.showingSettings = true }
                     }
                 }
                 .padding(.horizontal, 18)
@@ -349,7 +362,7 @@ struct CameraView: View {
                 Spacer()
                 HStack(spacing: 40) {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
-                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { ui.showingFunction = true }
                     }
                     // 按钮层**不禁用也不设 allowsHitTesting**：容器一旦
                     // .allowsHitTesting(false) 会连子树一起禁用，子按钮的
@@ -366,7 +379,7 @@ struct CameraView: View {
                         }
                     }
                     GlassIconButton(systemImage: "gearshape.fill") {
-                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
+                        withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { ui.showingSettings = true }
                     }
                 }
                 .padding(.bottom, 46)
@@ -452,9 +465,9 @@ struct CameraView: View {
                 Text("A:\(status.a) | B:\(status.b)")
                 Text("RUN:\(camera.isSessionRunning ? 1 : 0) REC:\(camera.isRecording ? 1 : 0) FIN:\(camera.isFinalizing ? 1 : 0)")
                 Text("LAY:\(camera.layout == .pictureInPicture ? "PIP" : "SPL") MOD:\(camera.mode == .dualFiles ? "B" : "A")")
-                Text("SET:\(showingSettings ? 1 : 0) FUN:\(showingFunction ? 1 : 0) GEN:\(camera.previewGeneration) BTN:\(camera.isRecording || camera.isFinalizing ? 1 : 0)")
+                Text("SET:\(ui.showingSettings ? 1 : 0) FUN:\(ui.showingFunction ? 1 : 0) GEN:\(camera.previewGeneration) BTN:\(camera.isRecording || camera.isFinalizing ? 1 : 0)")
                 Text("ANG A:\(camera.previewAngleA, specifier: "%.0f") M:\(camera.previewMirrorA ? 1 : 0) | B:\(camera.previewAngleB, specifier: "%.0f") M:\(camera.previewMirrorB ? 1 : 0)")
-                Text("PIP:\(Int(pipOffset.width)),\(Int(pipOffset.height))")
+                Text("PIP:\(Int(ui.pipOffset.width)),\(Int(ui.pipOffset.height))")
             }
             .font(.system(size: 9, weight: .medium, design: .monospaced))
             .foregroundStyle(.yellow)
