@@ -169,12 +169,12 @@ struct CameraView: View {
     }
 
     /// 单路预览：纯显示容器（不拦截触摸、无镜头角标）
-    /// 预览层实例由 CameraManager 持有；重配后新 layer 经 previewGeneration
-    /// 触发更新：**.id(previewGeneration)** 强制 SwiftUI 重建容器，
-    /// PreviewContainerView.didSet 负责在同一容器内摘旧层挂新层（双保险）。
+    /// 预览层由 CameraManager 在 init 中一次性创建并持有（永不重建，
+    /// 见 CameraManager.applyConfiguration 注释），本视图只负责把它
+    /// 放进视图层级、跟随布局尺寸；PreviewContainerView.didSet/
+    /// layoutSubviews 负责挂载与跟随 frame。
     private func previewSlot(_ slot: CameraSlot) -> some View {
         PreviewLayerView(layer: slot == .a ? camera.previewLayerA : camera.previewLayerB)
-            .id("preview-\(slot.id)-\(camera.previewGeneration)")
     }
 
     // MARK: 预览几何（分屏：A 占一半、B 占另一半；画中画：A 全屏、B 右下角）

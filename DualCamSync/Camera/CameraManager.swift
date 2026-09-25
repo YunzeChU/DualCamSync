@@ -28,13 +28,12 @@ final class CameraManager {
     let session = AVCaptureMultiCamSession()
 
     /// 两路独立预览层（视图层通过 PreviewLayerView 包装渲染）
-    /// 每次会话重配都**重建全新实例** + 递增 previewGeneration 触发 SwiftUI
-    /// 用 .id 强制重建预览容器——绕开多摄经典坑：teardown 移除连接后
-    /// previewLayer.connection 残留，下一次 canAddConnection 失败 → 一路黑屏。
-    /// private(set)：本文件可重建赋值，视图层只读。
+    /// 在 init 中一次性创建并**永不重建**（回到 v1.0 双路预览正常的实现；
+    /// 真机验证：重建全新 layer 后手动建连会被 canAddConnection 拒绝）。
+    /// private(set)：本文件可赋值，视图层只读。
     private(set) var previewLayerA: AVCaptureVideoPreviewLayer!
     private(set) var previewLayerB: AVCaptureVideoPreviewLayer!
-    /// 预览层代际号：每次重建预览层 +1，CameraView 用 .id 强制重建预览容器
+    /// 重配次数计数（诊断横幅 GEN 用；不再用于重建预览层/容器）
     var previewGeneration = 0
     private var previewConnA: AVCaptureConnection?
     private var previewConnB: AVCaptureConnection?
@@ -311,13 +310,12 @@ final class CameraManager {
             try applyFormat(device: camB.device, preset: preset)
 
             // 预览层连接（手动建连）
-            // 每次重配都重建全新实例并递增 previewGeneration，触发 SwiftUI 换层。
-            // 多摄经典坑：teardown 移除连接后，旧 previewLayer.connection 引用
-            // 未清干净，下一次 canAddConnection 可能失败 → 某一路黑屏。
-            // 因此不能只在 previewGeneration > 0 时重建（首启自愈重试时代际仍为 0，
-            // 会复用带残留 connection 的旧层，导致 B 路预览始终黑屏）。
-            previewLayerA = Self.makePreviewLayer(session: session)
-            previewLayerB = Self.makePreviewLayer(session: session)
+            // 预览层在 init 中一次性创建、**永不重建**（回到 v1.0 双路预览
+            // 正常的实现）。多次真机验证：重建全新 previewLayer 实例后，
+            // 手动 AVCaptureConnection 会被 canAddConnection 拒绝
+            // （"会话拒绝连接，N 个视频端口均被拒"）；而首次创建的层
+            // 在 addInput 后可正常建连。重配只走 teardown（移除旧连接）+
+            // 同层重新建连，previewGeneration 仅作为重配次数计数供诊断。
             previewGeneration += 1
             previewConnA = makePreviewConnection(layer: previewLayerA, input: inputA)
             previewConnB = makePreviewConnection(layer: previewLayerB, input: inputB)
@@ -404,11 +402,14 @@ final class CameraManager {
             return existing
         }
         let videoPorts = input.ports.filter { $0.mediaType == .video }
-        guard !videoPorts.isEmpty else {
+        guard let firstPort = videoPorts.first else {
             if layer === previewLayerA { lastPreviewFailureA = "端口缺失" } else { lastPreviewFailureB = "端口缺失" }
             return nil
         }
-        for port in videoPorts {
+        // 首选第一个视频端口（v1.0 双路预览正常即此实现）；
+        // 失败时再遍历其余视频端口兜底（部分镜头含虚拟/辅助端口会拒连）
+        let candidates = [firstPort] + videoPorts.dropFirst()
+        for port in candidates {
             let conn = AVCaptureConnection(inputPort: port, videoPreviewLayer: layer)
             guard session.canAddConnection(conn) else { continue }
             // 前置不镜像（需求：前置摄像头不允许镜像）
