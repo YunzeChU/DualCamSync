@@ -361,6 +361,11 @@ final class CameraManager {
                 }
             } else {
                 previewRetryCount = 0
+                // 建连成功后**再显式应用一次方向**：若本次重配存在"建连失败
+                // → 0.4s 延迟重配"窗口，A 路连接角度可能未被设置（停在系统
+                // 默认方向，与 B 差 180°——用户实测横屏时镜头 A 倒 180°）。
+                // startRunning 后补设 videoRotationAngle 依然有效且安全。
+                applyOrientation()
             }
         } catch {
             session.commitConfiguration()
@@ -438,6 +443,12 @@ final class CameraManager {
         (Self.describeFailure(previewConnA, lastFailure: lastPreviewFailureA),
          Self.describeFailure(previewConnB, lastFailure: lastPreviewFailureB))
     }
+    /// 两路预览连接当前旋转角 / 镜像状态（诊断横幅 ANG 行用：
+    /// 定位"横屏镜头 A 倒 180°"——若 A 角度为 -1 或与 B 不一致即方向未应用）
+    var previewAngleA: CGFloat { previewConnA?.videoRotationAngle ?? -1 }
+    var previewAngleB: CGFloat { previewConnB?.videoRotationAngle ?? -1 }
+    var previewMirrorA: Bool { previewConnA?.isVideoMirrored ?? false }
+    var previewMirrorB: Bool { previewConnB?.isVideoMirrored ?? false }
     /// 会话是否正在运行（诊断用）
     var isSessionRunning: Bool { session.isRunning }
 
@@ -655,8 +666,19 @@ final class CameraManager {
     }
 
     /// 判断某条连接是否来自前置摄像头（用于选择旋转基准）
+    /// 遍历**全部视频端口**逐个判断：部分镜头输入含辅助/虚拟端口，
+    /// 仅看 inputPorts.first 可能拿到非视频端口而误判为后置（前后置
+    /// 旋转基准相差 90°，误判会让画面倒 180°——用户实测横屏 A 倒）。
     private static func isFrontConnection(_ conn: AVCaptureConnection?) -> Bool {
-        conn?.inputPorts.first?.sourceDevicePosition == .front
+        guard let conn else { return false }
+        for port in conn.inputPorts where port.mediaType == .video {
+            switch port.sourceDevicePosition {
+            case .front: return true
+            case .back: return false
+            default: continue
+            }
+        }
+        return false
     }
 
     /// 杜比视界 HEVC 码型
@@ -665,14 +687,15 @@ final class CameraManager {
 
     /// 杜比视界能力探测 + 输出编码器设置（**必须在 commitConfiguration 之前调用**）
     /// -----------------------------------------------------------------------
-    /// 判据只有一条：两路设备都具备 10-bit HDR 采集格式。
-    /// 注意：**不能**依赖 MovieFileOutput.availableVideoCodecTypes——
-    /// 该列表在设备 activeFormat 还是 8-bit 时不含 dvhe，
-    /// 会把支持杜比视界的设备（iPhone 17 Pro）误判为"不支持"导致开关永远灰。
-    /// 另外 setOutputSettings 必须发生在会话配置阶段（commit 前），
-    /// 运行中调用可能触发异常导致闪退——这就是"杜比点开后卡顿闪退"的根因之一。
+    /// 判据（全部满足才可用）：
+    ///  1. 当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 采集格式；
+    ///  2. MovieFileOutput 可用编码器列表确实含 dvhe。
+    /// 双条件与 applyFormat（切 10-bit）、applyOutputCodec（设 dvhe）行为完全一致，
+    /// 避免"判据说支持、实际切不了/设不了"的错配——错配会让 setOutputSettings(dvhe)
+    /// 在 8-bit 连接上抛 NSException（真机崩溃报告实锤）。
+    /// setOutputSettings 必须在会话配置阶段（commit 前）调用，运行中调用会闪退。
     private func refreshDolbyCapability() {
-        guard mode == .dualFiles, cameraA != nil, cameraB != nil else {
+        guard mode == .dualFiles, let camA = cameraA, let camB = cameraB else {
             let wasAvailable = isDolbyVisionAvailable
             isDolbyVisionAvailable = false
             if dolbyVisionEnabled {
@@ -682,34 +705,42 @@ final class CameraManager {
             applyOutputCodec(useDolby: false)
             return
         }
-        let deviceOK = [cameraA?.device, cameraB?.device]
+        // 判据收紧：当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 格式，
+        // **且** MovieFileOutput 可用编码器列表确实含 dvhe。
+        // 之前只查"设备存在任一 10-bit 格式"，会与实际 applyFormat 切到的
+        // 格式脱节：档位无 10-bit 时 applyFormat 静默回退 8-bit，这里却仍判
+        // "支持"，随后 setOutputSettings(dvhe) 在 8-bit 连接上抛 NSException
+        // → SIGABRT（真机崩溃报告实锤，见 applyOutputCodec 注释）。
+        let dims = preset.landscapeDimensions
+        let formatOK = [camA.device, camB.device].allSatisfy {
+            findHDRFormat(for: $0, width: dims.width, height: dims.height) != nil
+        }
+        let codecOK = [movieOutputA, movieOutputB]
             .compactMap { $0 }
-            .allSatisfy(deviceSupportsHDRCapture)
+            .allSatisfy { $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec) }
 
-        isDolbyVisionAvailable = deviceOK
-        if dolbyVisionEnabled && !isDolbyVisionAvailable {
+        let available = formatOK && codecOK
+        isDolbyVisionAvailable = available
+        if dolbyVisionEnabled && !available {
             dolbyVisionEnabled = false
-            showDegradationBanner("杜比视界当前不可用，已自动关闭")
+            showDegradationBanner("当前档位不支持杜比视界，已自动关闭")
         }
-        applyOutputCodec(useDolby: dolbyVisionEnabled && isDolbyVisionAvailable)
-    }
-
-    /// 设备是否有 10-bit HDR 采集格式（杜比视界内容由 10-bit 双平面格式承载）
-    private func deviceSupportsHDRCapture(_ device: AVCaptureDevice) -> Bool {
-        let targetVideoRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
-        let targetFullRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
-        return device.formats.contains { format in
-            let subtype = UInt32(CMFormatDescriptionGetMediaSubType(format.formatDescription))
-            return subtype == targetVideoRange || subtype == targetFullRange
-        }
+        applyOutputCodec(useDolby: dolbyVisionEnabled && available)
     }
 
     /// 设置 MovieFileOutput 输出编码器（hevc / dvhe）。
     /// 只允许在会话配置阶段（commitConfiguration 之前）调用。
+    /// 安全阀：AVCaptureMovieFileOutput 对**不支持的编码器**直接抛 NSException
+    /// （真机崩溃报告：setOutputSettings(dvhe) → objc_exception_throw →
+    /// SIGABRT），NSException 无法用 Swift do-catch 捕获，只能"预防"——
+    /// 每个输出先查 availableVideoCodecTypes 是否含目标码型，不含则静默
+    /// 退回 HEVC，保证杜比开关无论设备/档位如何都不会导致闪退。
     private func applyOutputCodec(useDolby: Bool) {
         guard mode == .dualFiles, let outA = movieOutputA, let outB = movieOutputB else { return }
-        let codec: AVVideoCodecType = useDolby ? Self.dolbyVisionCodec : .hevc
         for out in [outA, outB] {
+            let codec: AVVideoCodecType =
+                (useDolby && out.availableVideoCodecTypes.contains(Self.dolbyVisionCodec))
+                ? Self.dolbyVisionCodec : .hevc
             for conn in out.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
                 out.setOutputSettings([AVVideoCodecKey: codec], for: conn)
             }

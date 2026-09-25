@@ -96,7 +96,18 @@ struct CameraView: View {
             syncOrientation()
         }
         .onReceive(NotificationCenter.default.publisher(for: UIDevice.orientationDidChangeNotification)) { _ in
-            syncOrientation()
+            // 通知到达时 effectiveGeometry.interfaceOrientation 可能还是旧值
+            // （横屏 180° 翻转等场景：geo.size 不变不触发 onChange，通知若
+            // 在几何更新前同步会读到翻转前的方向 → 画面看起来"倒 180°"）。
+            // 延迟到几何更新后再读，取到准确方向。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+                syncOrientation()
+            }
+        }
+        // 录制停止后强制重同步一次：录制中 OrientationLockView 锁方向，
+        // 停止后屏幕方向可能已变，预览角度需要跟着刷新
+        .onChange(of: camera.isRecording) { _, isRecording in
+            if !isRecording { syncOrientation() }
         }
         .onChange(of: scenePhase) { _, newPhase in
             // 退后台立即停止录制并保存（需求 7）
@@ -169,29 +180,39 @@ struct CameraView: View {
                            : (isLandscape ? .leading : .top))
             if camera.layout == .pictureInPicture {
                 // 画中画：B 悬浮右下角，可拖动
+                // 手势必须挂在**外层可交互容器**上：PreviewLayerView 的底层
+                // UIView（PreviewContainerView）设了 isUserInteractionEnabled=false
+                // （为修"按键点不动"），UIKit hit-test 直接跳过该区域，SwiftUI
+                // 的 DragGesture 若挂在预览层上永远收不到触摸（真机实测：手势
+                // 代码已加但拖不动）。因此：预览层 .allowsHitTesting(false)
+                // 纯显示，手势挂在外层 ZStack，.contentShape 显式声明命中区域。
                 let pipSize = pipWindowSize(geo, isLandscape)
-                previewSlot(.b)
-                    .frame(width: pipSize.width, height: pipSize.height)
-                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    .shadow(color: .black.opacity(0.25), radius: 9, x: 0, y: 3)
-                    .offset(x: pipOffset.width + pipDragOffset.width,
-                            y: pipOffset.height + pipDragOffset.height)
-                    .padding(20)
-                    .gesture(
-                        DragGesture()
-                            .onChanged { value in
-                                pipDragOffset = value.translation
-                            }
-                            .onEnded { value in
-                                pipOffset = CGSize(
-                                    width: pipOffset.width + value.translation.width,
-                                    height: pipOffset.height + value.translation.height)
-                                pipDragOffset = .zero
-                                clampPipOffset(to: geo.size, window: pipSize)
-                            }
-                    )
-                    .frame(maxWidth: .infinity, maxHeight: .infinity,
-                           alignment: .bottomTrailing)
+                ZStack {
+                    previewSlot(.b)
+                        .allowsHitTesting(false)
+                }
+                .frame(width: pipSize.width, height: pipSize.height)
+                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .shadow(color: .black.opacity(0.25), radius: 9, x: 0, y: 3)
+                .contentShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                .offset(x: pipOffset.width + pipDragOffset.width,
+                        y: pipOffset.height + pipDragOffset.height)
+                .padding(20)
+                .gesture(
+                    DragGesture()
+                        .onChanged { value in
+                            pipDragOffset = value.translation
+                        }
+                        .onEnded { value in
+                            pipOffset = CGSize(
+                                width: pipOffset.width + value.translation.width,
+                                height: pipOffset.height + value.translation.height)
+                            pipDragOffset = .zero
+                            clampPipOffset(to: geo.size, window: pipSize)
+                        }
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity,
+                       alignment: .bottomTrailing)
             } else {
                 // 分屏：B 占右/下半
                 previewSlot(.b)
@@ -209,6 +230,10 @@ struct CameraView: View {
         .onChange(of: geo.size) { _, _ in
             syncOrientation()
             if camera.layout == .pictureInPicture {
+                // 旋转后先清零拖动残留，再按新屏幕尺寸重新 clamp，
+                // 保证小窗必然回到屏内（用户实测：首次竖→横旋转时小窗会
+                // 跑到屏幕外，正是残留/旧基准未重算的表现）
+                pipDragOffset = .zero
                 clampPipOffset(to: geo.size, window: pipWindowSize(geo, isLandscape))
             }
         }
@@ -269,6 +294,7 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
                     }
+                    .allowsHitTesting(true)
                     // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
                     // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
                     // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
@@ -277,10 +303,12 @@ struct CameraView: View {
                     ShutterButton(isRecording: camera.isRecording) {
                         camera.isRecording ? camera.stopRecording() : camera.startRecording()
                     }
+                    .allowsHitTesting(true)
                     Spacer()
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
                     }
+                    .allowsHitTesting(true)
                     // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
                     // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
                     // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
@@ -289,6 +317,10 @@ struct CameraView: View {
                 .padding(.horizontal, 18)
                 .padding(.vertical, 28)
             }
+            // 透明容器默认命中区域=全屏，会把底层 PIP 小窗的拖动手势全部拦截
+            // （真机实测：小窗拖不动）。容器整体让出命中、三个按钮各自恢复，
+            // 透明区不再挡触摸，小窗可拖动，按钮照常可点。
+            .allowsHitTesting(false)
         } else {
             // 竖屏：底部横排三键（功能 / 快门 / 设置）
             VStack {
@@ -297,6 +329,7 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
                     }
+                    .allowsHitTesting(true)
                     // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
                     // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
                     // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
@@ -304,9 +337,11 @@ struct CameraView: View {
                     ShutterButton(isRecording: camera.isRecording) {
                         camera.isRecording ? camera.stopRecording() : camera.startRecording()
                     }
+                    .allowsHitTesting(true)
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
                     }
+                    .allowsHitTesting(true)
                     // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
                     // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
                     // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
@@ -314,6 +349,7 @@ struct CameraView: View {
                 }
                 .padding(.bottom, 46)
             }
+            .allowsHitTesting(false)
         }
     }
 
@@ -366,6 +402,7 @@ struct CameraView: View {
             Spacer()
         }
         .padding(.horizontal, 30)
+        .allowsHitTesting(false)  // 全屏透明容器，命中测试必须让出（否则挡 PIP 小窗拖动）
     }
 
     /// 面板背景遮罩
@@ -393,6 +430,8 @@ struct CameraView: View {
                 Text("RUN:\(camera.isSessionRunning ? 1 : 0) REC:\(camera.isRecording ? 1 : 0) FIN:\(camera.isFinalizing ? 1 : 0)")
                 Text("LAY:\(camera.layout == .pictureInPicture ? "PIP" : "SPL") MOD:\(camera.mode == .dualFiles ? "B" : "A")")
                 Text("SET:\(showingSettings ? 1 : 0) FUN:\(showingFunction ? 1 : 0) GEN:\(camera.previewGeneration) BTN:\(camera.isRecording || camera.isFinalizing ? 1 : 0)")
+                Text("ANG A:\(camera.previewAngleA, specifier: "%.0f") M:\(camera.previewMirrorA ? 1 : 0) | B:\(camera.previewAngleB, specifier: "%.0f") M:\(camera.previewMirrorB ? 1 : 0)")
+                Text("PIP:\(Int(pipOffset.width)),\(Int(pipOffset.height))")
             }
             .font(.system(size: 9, weight: .medium, design: .monospaced))
             .foregroundStyle(.yellow)
