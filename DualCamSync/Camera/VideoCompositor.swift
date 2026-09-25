@@ -62,9 +62,11 @@ final class VideoCompositor {
             second = CGRect(x: target.midX, y: 0, width: half.width, height: half.height)
         } else {
             half = CGRect(x: 0, y: 0, width: target.width, height: target.height / 2)
-            // CIImage 坐标系原点在左下：first 在下方（A），second 在上方（B）
-            first = half
-            second = CGRect(x: 0, y: target.midY, width: half.width, height: half.height)
+            // CIImage 坐标系原点在左下：y=midY 是画面上半、y=0 是下半。
+            // 与预览一致：A 在上、B 在下（原实现 A 在下 B 在上，与预览
+            // 上下颠倒——用户实测竖屏分屏合成视频与预览不一致）
+            first = CGRect(x: 0, y: target.midY, width: half.width, height: half.height)
+            second = half
         }
         let imageA = aspectFill(a, into: first)
         let imageB = aspectFill(b, into: second)

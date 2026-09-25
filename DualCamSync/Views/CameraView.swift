@@ -208,11 +208,16 @@ struct CameraView: View {
                                 width: pipOffset.width + value.translation.width,
                                 height: pipOffset.height + value.translation.height)
                             pipDragOffset = .zero
-                            clampPipOffset(to: geo.size, window: pipSize)
+                            clampPipOffset(to: geo.size, window: pipSize, isLandscape: isLandscape)
                         }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity,
                        alignment: .bottomTrailing)
+                // 默认位置避开三键控件区：竖屏抬高到底部三键之上（190），
+                // 横屏左移避开右侧竖排三键（200）——否则小窗盖住按钮
+                // （按钮虽在上层仍可点，但画面被遮、误触率高）
+                .padding(.bottom, isLandscape ? 24 : 190)
+                .padding(.trailing, isLandscape ? 200 : 24)
             } else {
                 // 分屏：B 占右/下半
                 previewSlot(.b)
@@ -234,7 +239,8 @@ struct CameraView: View {
                 // 保证小窗必然回到屏内（用户实测：首次竖→横旋转时小窗会
                 // 跑到屏幕外，正是残留/旧基准未重算的表现）
                 pipDragOffset = .zero
-                clampPipOffset(to: geo.size, window: pipWindowSize(geo, isLandscape))
+                clampPipOffset(to: geo.size, window: pipWindowSize(geo, isLandscape),
+                               isLandscape: isLandscape)
             }
         }
     }
@@ -249,10 +255,12 @@ struct CameraView: View {
     }
 
     /// 把小窗偏移限制在屏内（完整可见，四周留 8pt 边距）
-    private func clampPipOffset(to size: CGSize, window: CGSize) {
-        // 无偏移时小窗位于右下角（距边 20）；offset 相对该位置
-        let baseX = size.width - window.width - 20
-        let baseY = size.height - window.height - 20
+    /// 基准与 PIP 小窗默认位置一致（竖屏底部三键之上、横屏避开右侧三键），
+    /// 保证拖放手感连续、旋转后 clamp 回到"不遮按钮"的默认区域。
+    private func clampPipOffset(to size: CGSize, window: CGSize, isLandscape: Bool) {
+        // 无偏移时小窗位于默认位置（距底/距右见 previewArea 的 padding）
+        let baseX = size.width - window.width - (isLandscape ? 200 : 24)
+        let baseY = size.height - window.height - (isLandscape ? 24 : 190)
         let minOX = 8 - baseX
         let maxOX = (size.width - window.width - 8) - baseX
         let minOY = 8 - baseY
@@ -294,33 +302,25 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
                     }
-                    .allowsHitTesting(true)
-                    // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
-                    // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
-                    // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
-                    //  录制键才能打开面板"——见诊断横幅 BTN 行）
+                    // 按钮层**不禁用也不设 allowsHitTesting**：容器一旦
+                    // .allowsHitTesting(false) 会连子树一起禁用，子按钮的
+                    // .allowsHitTesting(true) 无法覆盖（真机实测全键失效）。
+                    // 面板内部行已有 isRecording/isFinalizing 防护（录制中
+                    // 改设置 setter 静默 return），保证首次启动面板必能打开。
                     Spacer()
                     ShutterButton(isRecording: camera.isRecording) {
                         camera.isRecording ? camera.stopRecording() : camera.startRecording()
                     }
-                    .allowsHitTesting(true)
                     Spacer()
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
                     }
-                    .allowsHitTesting(true)
-                    // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
-                    // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
-                    // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
-                    //  录制键才能打开面板"——见诊断横幅 BTN 行）
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 28)
             }
-            // 透明容器默认命中区域=全屏，会把底层 PIP 小窗的拖动手势全部拦截
-            // （真机实测：小窗拖不动）。容器整体让出命中、三个按钮各自恢复，
-            // 透明区不再挡触摸，小窗可拖动，按钮照常可点。
-            .allowsHitTesting(false)
+            // 布局容器空区域默认不参与命中（Spacer/间隙穿透），
+            // 不会拦截底层 PIP 小窗的拖动手势，无需 allowsHitTesting。
         } else {
             // 竖屏：底部横排三键（功能 / 快门 / 设置）
             VStack {
@@ -329,27 +329,22 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
                     }
-                    .allowsHitTesting(true)
-                    // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
-                    // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
-                    // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
-                    //  录制键才能打开面板"——见诊断横幅 BTN 行）
+                    // 按钮层**不禁用也不设 allowsHitTesting**：容器一旦
+                    // .allowsHitTesting(false) 会连子树一起禁用，子按钮的
+                    // .allowsHitTesting(true) 无法覆盖（真机实测全键失效）。
+                    // 面板内部行已有 isRecording/isFinalizing 防护（录制中
+                    // 改设置 setter 静默 return），保证首次启动面板必能打开。
                     ShutterButton(isRecording: camera.isRecording) {
                         camera.isRecording ? camera.stopRecording() : camera.startRecording()
                     }
-                    .allowsHitTesting(true)
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
                     }
-                    .allowsHitTesting(true)
-                    // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
-                    // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
-                    // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
-                    //  录制键才能打开面板"——见诊断横幅 BTN 行）
                 }
                 .padding(.bottom, 46)
             }
-            .allowsHitTesting(false)
+            // 布局容器空区域默认不参与命中（Spacer/间隙穿透），
+            // 不会拦截底层 PIP 小窗的拖动手势，无需 allowsHitTesting。
         }
     }
 
