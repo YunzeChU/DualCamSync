@@ -38,37 +38,35 @@ struct CameraView: View {
                 // 录制中红色计时（顶部居中）
                 recordingTimerView()
 
-                // 功能面板（液态玻璃二级菜单，从功能键所在侧弹出：
-                // 竖屏从底部、横屏从右侧，弹簧+缩放+模糊，贴近原生菜单）
+                // 功能面板（液态玻璃二级菜单，从功能键所在侧弹出）
                 if showingFunction {
                     overlayDim()
                         .onTapGesture { dismissAllPanels() }
+                        .zIndex(9)
                     FunctionPanel { dismissAllPanels() }
                         .padding(isLandscape ? .trailing : .bottom,
                                  isLandscape ? 30 : 120)
                         .frame(maxWidth: .infinity, maxHeight: .infinity,
                                alignment: isLandscape ? .trailing : .bottom)
-                        .transition(
-                            .scale(scale: 0.82, anchor: isLandscape ? .trailing : .bottom)
-                                .combined(with: .opacity)
-                                .combined(with: .move(edge: isLandscape ? .trailing : .bottom))
-                        )
+                        // 不用 .transition：真机上首次弹出时转场动画可能不触发，
+                        // 面板停在"屏幕外/透明"的初始态 = "按键打不开"；
+                        // 去掉转场后 if 条件为真即直接可见（点一次录制键触发
+                        // 刷新后"能打开"，正是转场初始态被刷新的表现）。
+                        // zIndex 保证压在预览层之上。
+                        .zIndex(10)
                 }
 
                 // 设置面板（液态玻璃弹层，从设置键所在侧弹出）
                 if showingSettings {
                     overlayDim()
                         .onTapGesture { dismissAllPanels() }
+                        .zIndex(9)
                     SettingsPanel { dismissAllPanels() }
                         .padding(isLandscape ? .trailing : .bottom,
                                  isLandscape ? 30 : 120)
                         .frame(maxWidth: .infinity, maxHeight: .infinity,
                                alignment: isLandscape ? .trailing : .bottom)
-                        .transition(
-                            .scale(scale: 0.82, anchor: isLandscape ? .trailing : .bottom)
-                                .combined(with: .opacity)
-                                .combined(with: .move(edge: isLandscape ? .trailing : .bottom))
-                        )
+                        .zIndex(10)
                 }
 
     /// 降级/提示横幅
@@ -147,24 +145,34 @@ struct CameraView: View {
     /// 用固定顺序的两个插槽 + 计算帧布局：
     /// 旋转/切换布局时 ZStack 结构不变，SwiftUI 不会拆除重建预览容器，
     /// 避免共享预览层被摘除导致黑屏（原 HStack/VStack 分支切换会重建）。
+    /// B 路定位用 **frame + alignment 布局引擎**（而非 .offset 手动位移）：
+    /// 手动 offset 在旋转完成后的几何重算中会把 B 推出显示区域
+    /// （真机实测：分屏横屏旋转后 B 跑到屏幕外）。
     @ViewBuilder
     private func previewArea(geo: GeometryProxy, isLandscape: Bool) -> some View {
-        ZStack(alignment: .topLeading) {
+        ZStack {
+            // A 路：画中画占满全屏；分屏占左/上半
             previewSlot(.a)
                 .frame(width: slotAWidth(geo, isLandscape),
                        height: slotAHeight(geo, isLandscape))
-            previewSlot(.b)
-                .frame(width: slotBWidth(geo, isLandscape),
-                       height: slotBHeight(geo, isLandscape))
-                .offset(x: slotBX(geo, isLandscape), y: slotBY(geo, isLandscape))
-                .clipShape(camera.layout == .pictureInPicture
-                           ? AnyShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                           : AnyShape(Rectangle()))
-                // 画中画窗口：圆角 + 极浅阴影，把两个画面区分开
-                // （用户要求"非常非常非常浅"：低不透明度 + 小半径 + 短偏移；
-                //  分屏布局下两路各占半屏，不需要阴影，直接透明）
-                .shadow(color: .black.opacity(camera.layout == .pictureInPicture ? 0.25 : 0),
-                        radius: 9, x: 0, y: 3)
+            if camera.layout == .pictureInPicture {
+                // 画中画：B 悬浮右下角（0.34 比例 + 20pt 边距）
+                previewSlot(.b)
+                    .frame(width: geo.size.width * 0.34,
+                           height: geo.size.height * 0.34)
+                    .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .shadow(color: .black.opacity(0.25), radius: 9, x: 0, y: 3)
+                    .padding(20)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity,
+                           alignment: .bottomTrailing)
+            } else {
+                // 分屏：B 占右/下半
+                previewSlot(.b)
+                    .frame(width: isLandscape ? geo.size.width / 2 : geo.size.width,
+                           height: isLandscape ? geo.size.height : geo.size.height / 2)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity,
+                           alignment: isLandscape ? .trailing : .bottom)
+            }
         }
     }
 
@@ -187,30 +195,6 @@ struct CameraView: View {
     private func slotAHeight(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
         camera.layout == .pictureInPicture ? geo.size.height
             : (landscape ? geo.size.height : geo.size.height / 2)
-    }
-
-    private func slotBWidth(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
-        if camera.layout == .pictureInPicture { return geo.size.width * 0.34 }
-        return landscape ? geo.size.width / 2 : geo.size.width
-    }
-
-    private func slotBHeight(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
-        if camera.layout == .pictureInPicture { return geo.size.height * 0.34 }
-        return landscape ? geo.size.height : geo.size.height / 2
-    }
-
-    private func slotBX(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
-        if camera.layout == .pictureInPicture {
-            return geo.size.width - slotBWidth(geo, landscape) - 20
-        }
-        return landscape ? geo.size.width / 2 : 0
-    }
-
-    private func slotBY(_ geo: GeometryProxy, _ landscape: Bool) -> CGFloat {
-        if camera.layout == .pictureInPicture {
-            return geo.size.height - slotBHeight(geo, landscape) - 20
-        }
-        return landscape ? 0 : geo.size.height / 2
     }
 
     // MARK: - 三键控制层
