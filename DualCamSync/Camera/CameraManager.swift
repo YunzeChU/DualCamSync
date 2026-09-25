@@ -232,9 +232,19 @@ final class CameraManager {
         // 按 uniqueID 去重
         var seen = Set<String>()
         list = list.filter { seen.insert($0.id).inserted }
-        // 前置去重：iPhone 前置相机常被系统以多个虚拟设备暴露
-        // （TrueDepth 与 WideAngle 可能指向同一颗物理前置），导致
-        // 列表出现多个同名"前置"；同一"位置+镜头类型"只保留一个。
+        // 前置只保留一个：iPhone 17 系列前置以多个虚拟设备暴露
+        // （TrueDepth / WideAngle 等，且可能解析出不同 lensType，导致
+        // 下方 position|LensType 去重键不同、列表出现两个"前置"）。
+        // UI 上前置始终只有一个选项。
+        var frontSeen = false
+        list = list.filter { option in
+            if option.position == .front {
+                if frontSeen { return false }
+                frontSeen = true
+            }
+            return true
+        }
+        // 后置镜头去重：同一"位置+镜头类型"只保留一个（同上注释背景）
         var seenLens = Set<String>()
         list = list.filter { seenLens.insert("\($0.position.rawValue)|\($0.lensType.rawValue)").inserted }
         // 排序：后置优先，镜头顺序 超广角->广角->长焦->前置
