@@ -650,19 +650,29 @@ final class CameraManager {
 
     /// 旋转角度映射。
     /// 注意：**前后置传感器安装方向不同**——后置横装（landscape）、**前置竖装（portrait）**。
-    /// 同一界面方向下，前置连接必须用"后置角度 -90°"（等价 +270°），
-    /// 否则竖拍时后置成片竖、前置成片横（用户实测：修复前竖拍前置一直是横的）。
+    /// 后置横屏映射必须用系统标准（landscapeLeft=180、landscapeRight=0）：
+    /// 原实现 0/180 对调，导致后置横屏画面反 180°（用户实测：旋转后置
+    /// 所有镜头预览全反、前置正常——前置靠 back+270 派生"负负得正"）。
+    /// 前置因此不能继续从后置派生，改用独立映射表（数值 = 修复前实测
+    /// 正常的组合：portrait=0 / PUD=180 / landscapeLeft=270 / landscapeRight=90）。
     static func rotationAngle(for orientation: UIInterfaceOrientation, isFront: Bool = false) -> CGFloat {
         let back: CGFloat
         switch orientation {
         case .portrait:              back = 90
         case .portraitUpsideDown:    back = 270
-        case .landscapeLeft:         back = 0
-        case .landscapeRight:        back = 180
+        case .landscapeLeft:         back = 180
+        case .landscapeRight:        back = 0
         default:                     back = 90
         }
-        // 前置：传感器竖装，旋转基准与后置相差 -90°（mod 360）
-        return isFront ? (back + 270).truncatingRemainder(dividingBy: 360) : back
+        guard isFront else { return back }
+        // 前置：传感器竖装，独立映射（不能从后置派生）
+        switch orientation {
+        case .portrait:              return 0
+        case .portraitUpsideDown:    return 180
+        case .landscapeLeft:         return 270
+        case .landscapeRight:        return 90
+        default:                     return 0
+        }
     }
 
     /// 判断某条连接是否来自前置摄像头（用于选择旋转基准）
@@ -937,6 +947,14 @@ final class CameraManager {
 
     // MARK: - 录制
 
+    /// 画中画小窗位置（归一化 0~1：小窗中心相对屏宽/屏高的比例，y 从顶部算，
+    /// 与 SwiftUI 预览坐标一致）。录制开始前由 CameraView 写入当前小窗
+    /// 实际位置（默认避让位 + 拖动偏移）；录制中固定不更新——模式A合成时
+    /// VideoCompositor.makePiP 按此位置摆放 B 路小窗，保证"成片小窗位置 =
+    /// 录制开始时的预览位置"。默认值为竖屏默认避让位（右下偏上，距底 190、
+    /// 距右 24，屏 390×844 下中心 ≈ (0.80, 0.66)），录制前总是被覆盖。
+    var pipPosition: CGPoint = CGPoint(x: 0.805, y: 0.665)
+
     /// 开始录制：按当前布局/方向/规格启动对应录制器
     func startRecording() {
         guard !isRecording, !isFinalizing, isMultiCamSupported, cameraA != nil, cameraB != nil else {
@@ -975,7 +993,8 @@ final class CameraManager {
                 let target = targetOutputDimensions()
                 try modeARecorder.start(outputSize: target,
                                         layout: layout,
-                                        audioFormat: microphoneAudioFormat())
+                                        audioFormat: microphoneAudioFormat(),
+                                        pipPosition: pipPosition)
                 modeARecorder.onFinished = { [weak self] urls in
                     self?.handleRecordingFinished(urls: urls, token: token)
                 }

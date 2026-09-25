@@ -36,7 +36,7 @@ struct CameraView: View {
                 previewArea(geo: geo, isLandscape: isLandscape)
 
                 // 上层：三键控制层（竖屏底部横排 / 横屏右侧竖排）
-                controlOverlay(isLandscape: isLandscape)
+                controlOverlay(geo: geo, isLandscape: isLandscape)
 
                 // 录制中红色计时（顶部居中）
                 recordingTimerView()
@@ -199,6 +199,8 @@ struct CameraView: View {
                         y: pipOffset.height + pipDragOffset.height)
                 .padding(20)
                 .gesture(
+                    // 录制中禁用拖动：成片小窗位置 = 录制开始位置（拍后固定）
+                    camera.isRecording ? nil :
                     DragGesture()
                         .onChanged { value in
                             pipDragOffset = value.translation
@@ -254,6 +256,20 @@ struct CameraView: View {
         return CGSize(width: w, height: h)
     }
 
+    /// 计算小窗当前的归一化中心位置（0~1，y 从顶部算，与 SwiftUI 一致）。
+    /// 基准 = 默认避让位置（与 previewArea 的 padding、clampPipOffset 同一套
+    /// 常量），叠加拖动偏移 pipOffset；录制开始前由 controlOverlay 写入
+    /// camera.pipPosition，模式A合成时 makePiP 按此摆放成片小窗。
+    private func currentPipNormalizedPosition(geo: GeometryProxy, isLandscape: Bool) -> CGPoint {
+        let size = geo.size
+        let window = pipWindowSize(geo, isLandscape)
+        let baseX = size.width - window.width - (isLandscape ? 200 : 24)
+        let baseY = size.height - window.height - (isLandscape ? 24 : 190)
+        let centerX = baseX + pipOffset.width + window.width / 2
+        let centerY = baseY + pipOffset.height + window.height / 2
+        return CGPoint(x: centerX / size.width, y: centerY / size.height)
+    }
+
     /// 把小窗偏移限制在屏内（完整可见，四周留 8pt 边距）
     /// 基准与 PIP 小窗默认位置一致（竖屏底部三键之上、横屏避开右侧三键），
     /// 保证拖放手感连续、旋转后 clamp 回到"不遮按钮"的默认区域。
@@ -293,7 +309,7 @@ struct CameraView: View {
     // MARK: - 三键控制层
 
     @ViewBuilder
-    private func controlOverlay(isLandscape: Bool) -> some View {
+    private func controlOverlay(geo: GeometryProxy, isLandscape: Bool) -> some View {
         if isLandscape {
             // 横屏：右侧竖排三键（功能 / 快门 / 设置）
             HStack {
@@ -309,7 +325,13 @@ struct CameraView: View {
                     // 改设置 setter 静默 return），保证首次启动面板必能打开。
                     Spacer()
                     ShutterButton(isRecording: camera.isRecording) {
-                        camera.isRecording ? camera.stopRecording() : camera.startRecording()
+                        if camera.isRecording {
+                            camera.stopRecording()
+                        } else {
+                            // 录制前把当前小窗实际位置写入，成片小窗 = 录制开始位置
+                            camera.pipPosition = currentPipNormalizedPosition(geo: geo, isLandscape: isLandscape)
+                            camera.startRecording()
+                        }
                     }
                     Spacer()
                     GlassIconButton(systemImage: "gearshape.fill") {
@@ -335,7 +357,13 @@ struct CameraView: View {
                     // 面板内部行已有 isRecording/isFinalizing 防护（录制中
                     // 改设置 setter 静默 return），保证首次启动面板必能打开。
                     ShutterButton(isRecording: camera.isRecording) {
-                        camera.isRecording ? camera.stopRecording() : camera.startRecording()
+                        if camera.isRecording {
+                            camera.stopRecording()
+                        } else {
+                            // 录制前把当前小窗实际位置写入，成片小窗 = 录制开始位置
+                            camera.pipPosition = currentPipNormalizedPosition(geo: geo, isLandscape: isLandscape)
+                            camera.startRecording()
+                        }
                     }
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
