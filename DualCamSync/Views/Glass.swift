@@ -9,15 +9,13 @@ import SwiftUI
 /// 自动呈现动态模糊与折射效果；配合大圆角即可获得原生相机观感。
 extension View {
 
-    /// 圆角玻璃面板（设置面板 / 选摄面板）
-    /// 使用原生 `.glassEffect(.regular)` 保证在 iOS 26.6 上一定能渲染，
-    /// 再用 `.clipShape(RoundedRectangle)` 把玻璃背景裁成圆角矩形。
-    /// 不在 glassEffect 的 in: 中直接塞形状——部分 26.x 系统上该写法会导致
-    /// 面板整体不可见（用户反馈“点击后没有界面展开”）。
+    /// 面板容器（功能面板 / 设置面板）
+    /// 用户要求（真机验证）：液态玻璃背景在真机上渲染为**胶囊形**，
+    /// clipShape(RoundedRectangle) 无法裁成圆角矩形 → **直接不要背景**，
+    /// 且**不用任何替代材质**。面板内容（分区/行/文字）完整保留，
+    /// 仅去掉玻璃底，让面板直接浮在预览画面上。
     func glassPanel(cornerRadius: CGFloat = 28) -> some View {
         self
-            .glassEffect(.regular)
-            .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 
     /// 玻璃胶囊（镜头角标 / 状态条）

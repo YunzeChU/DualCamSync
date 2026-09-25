@@ -339,8 +339,8 @@ final class CameraManager {
             session.commitConfiguration()
             session.startRunning()
             refreshCapabilities()
-            // commit + startRunning 之后：杜比开启时切 10-bit HDR 采集格式
-            applyHDRFormatIfNeeded()
+            // 杜比的 10-bit HDR 格式已在 applyFormat（commit 前）切好；
+            // 不再在 startRunning 后切换 activeFormat（多摄下会卡顿闪退）
 
             // 预览连接建立失败不能静默：双摄预览只有一路，用户无法发现。
             // 自愈：双摄首次配置存在系统时序问题，延迟重配一次通常可恢复双路；
@@ -448,13 +448,26 @@ final class CameraManager {
     /// 逐设备配置分辨率/帧率
     private func applyFormat(device: AVCaptureDevice, preset: ResolutionPreset) throws {
         let dims = preset.landscapeDimensions
-        guard let format = device.formats.first(where: { f in
-            let fd = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-            return fd.width == dims.width && fd.height == dims.height
-                && f.videoSupportedFrameRateRanges.contains {
-                    $0.minFrameRate <= Double(preset.fps) && Double(preset.fps) <= $0.maxFrameRate
-                }
-        }) else {
+        let targetFPS = Double(preset.fps)
+        // 杜比开启时优先选同尺寸/同帧率的 10-bit HDR 格式（DV 内容必须由
+        // 10-bit 承载）。**必须在 commit 前完成格式切换**：真机验证在多摄
+        // 会话 startRunning 后切换 activeFormat 会卡顿闪退（原实现把
+        // applyHDRFormatIfNeeded 放在 commit+startRunning 之后调用，
+        // 即"杜比一开就闪退"的直接原因）。
+        var format: AVCaptureDevice.Format?
+        if dolbyVisionEnabled {
+            format = findHDRFormat(for: device, width: dims.width, height: dims.height)
+        }
+        if format == nil {
+            format = device.formats.first(where: { f in
+                let fd = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                return fd.width == dims.width && fd.height == dims.height
+                    && f.videoSupportedFrameRateRanges.contains {
+                        $0.minFrameRate <= targetFPS && targetFPS <= $0.maxFrameRate
+                    }
+            })
+        }
+        guard let format else {
             throw CameraError.presetUnsupported(preset)
         }
         // 设备配置类调用必须 lock；lock 失败绝不能继续（未锁定设备 unlock 会抛 NSException）
@@ -700,28 +713,6 @@ final class CameraManager {
             for conn in out.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
                 out.setOutputSettings([AVVideoCodecKey: codec], for: conn)
             }
-        }
-    }
-
-    /// 杜比视界开启时：把两台设备 activeFormat 切到同档 10-bit HDR 格式。
-    /// DV 的 HDR 内容由 10-bit 采集格式承载（编码器 dvhe 只是容器）——
-    /// 若格式仍是 8-bit，成片即使带 dvhe 容器观感也是 SDR。
-    /// 在 commit + startRunning 之后调用（activeFormat 变更不影响会话结构）。
-    /// 注意：lockForConfiguration 返回 false 时**绝不能**调用 unlock——
-    /// 未锁定的设备 unlock 会抛 NSException 直接闪退（杜比闪退根因之二）。
-    private func applyHDRFormatIfNeeded() {
-        guard dolbyVisionEnabled && isDolbyVisionAvailable else { return }
-        for device in [cameraA?.device, cameraB?.device].compactMap({ $0 }) {
-            let dims = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
-            guard let hdr = findHDRFormat(for: device, width: dims.width, height: dims.height),
-                  hdr != device.activeFormat else { continue }
-            guard (try? device.lockForConfiguration()) != nil else { continue }
-            device.activeFormat = hdr
-            // 切换 activeFormat 可能重置帧率，重新锁定到当前档位
-            let duration = CMTime(value: 1, timescale: CMTimeScale(preset.fps))
-            device.activeVideoMinFrameDuration = duration
-            device.activeVideoMaxFrameDuration = duration
-            device.unlockForConfiguration()
         }
     }
 

@@ -21,6 +21,9 @@ struct CameraView: View {
 
     @State private var showingFunction = false
     @State private var showingSettings = false
+    /// 画中画小窗拖动偏移（@State：旋转/切布局后保留，越界时 clamp）
+    @State private var pipOffset = CGSize.zero
+    @State private var pipDragOffset = CGSize.zero
 
     var body: some View {
         @Bindable var camera = camera
@@ -148,21 +151,45 @@ struct CameraView: View {
     /// B 路定位用 **frame + alignment 布局引擎**（而非 .offset 手动位移）：
     /// 手动 offset 在旋转完成后的几何重算中会把 B 推出显示区域
     /// （真机实测：分屏横屏旋转后 B 跑到屏幕外）。
+    /// 画中画小窗：尺寸参考苹果原生相机（宽约屏宽 26%、高按画面比例），
+    /// 可拖动（@State pipOffset 记忆位置，越界 clamp 回屏内）。
     @ViewBuilder
     private func previewArea(geo: GeometryProxy, isLandscape: Bool) -> some View {
         ZStack {
-            // A 路：画中画占满全屏；分屏占左/上半
+            // A 路：画中画占满全屏；分屏占左/上半。
+            // 分屏必须显式对齐（竖屏 top / 横屏 leading）：ZStack 默认居中，
+            // 不对齐时 A 会浮在垂直/水平中间，与 B 重叠（用户实测"上面的画面
+            // 被下面的遮挡一部分 + 屏幕最顶上黑色"正是 A 未对齐所致）。
             previewSlot(.a)
                 .frame(width: slotAWidth(geo, isLandscape),
                        height: slotAHeight(geo, isLandscape))
+                .frame(maxWidth: .infinity, maxHeight: .infinity,
+                       alignment: camera.layout == .pictureInPicture
+                           ? .center
+                           : (isLandscape ? .leading : .top))
             if camera.layout == .pictureInPicture {
-                // 画中画：B 悬浮右下角（0.34 比例 + 20pt 边距）
+                // 画中画：B 悬浮右下角，可拖动
+                let pipSize = pipWindowSize(geo, isLandscape)
                 previewSlot(.b)
-                    .frame(width: geo.size.width * 0.34,
-                           height: geo.size.height * 0.34)
+                    .frame(width: pipSize.width, height: pipSize.height)
                     .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
                     .shadow(color: .black.opacity(0.25), radius: 9, x: 0, y: 3)
+                    .offset(x: pipOffset.width + pipDragOffset.width,
+                            y: pipOffset.height + pipDragOffset.height)
                     .padding(20)
+                    .gesture(
+                        DragGesture()
+                            .onChanged { value in
+                                pipDragOffset = value.translation
+                            }
+                            .onEnded { value in
+                                pipOffset = CGSize(
+                                    width: pipOffset.width + value.translation.width,
+                                    height: pipOffset.height + value.translation.height)
+                                pipDragOffset = .zero
+                                clampPipOffset(to: geo.size, window: pipSize)
+                            }
+                    )
                     .frame(maxWidth: .infinity, maxHeight: .infinity,
                            alignment: .bottomTrailing)
             } else {
@@ -174,6 +201,39 @@ struct CameraView: View {
                            alignment: isLandscape ? .trailing : .bottom)
             }
         }
+        // 尺寸变化（= 界面旋转）时：同步相机方向 + 把小窗偏移 clamp 回屏内。
+        // 方向同步不能只靠 UIDevice.orientationDidChangeNotification：真机上
+        // "从倾斜回正"（不经过 faceUp）时该通知不触发，画面角度停在旧值
+        // （用户实测：向左倾 → 画面顺时针差 90°；向右倾 → 逆时针差 90°；
+        //  放平才恢复正常）。geo.size 变化必然伴随界面旋转，此处兜底。
+        .onChange(of: geo.size) { _, _ in
+            syncOrientation()
+            if camera.layout == .pictureInPicture {
+                clampPipOffset(to: geo.size, window: pipWindowSize(geo, isLandscape))
+            }
+        }
+    }
+
+    /// 画中画小窗尺寸：宽约屏宽 26%（参考苹果原生相机小窗），
+    /// 高按当前画面比例（竖屏 9:16、横屏 16:9）——比例与合成输出一致，
+    /// 保证"模式A合成时小窗大小与预览框一致、上下裁切"。
+    private func pipWindowSize(_ geo: GeometryProxy, _ landscape: Bool) -> CGSize {
+        let w = geo.size.width * 0.26
+        let h = w * (landscape ? 9.0 / 16.0 : 16.0 / 9.0)
+        return CGSize(width: w, height: h)
+    }
+
+    /// 把小窗偏移限制在屏内（完整可见，四周留 8pt 边距）
+    private func clampPipOffset(to size: CGSize, window: CGSize) {
+        // 无偏移时小窗位于右下角（距边 20）；offset 相对该位置
+        let baseX = size.width - window.width - 20
+        let baseY = size.height - window.height - 20
+        let minOX = 8 - baseX
+        let maxOX = (size.width - window.width - 8) - baseX
+        let minOY = 8 - baseY
+        let maxOY = (size.height - window.height - 8) - baseY
+        pipOffset.width = min(max(pipOffset.width, minOX), maxOX)
+        pipOffset.height = min(max(pipOffset.height, minOY), maxOY)
     }
 
     /// 单路预览：纯显示容器（不拦截触摸、无镜头角标）
@@ -209,8 +269,10 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
                     }
-                    .disabled(camera.isRecording || camera.isFinalizing)
-                    .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
+                    // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
+                    // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
+                    // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
+                    //  录制键才能打开面板"——见诊断横幅 BTN 行）
                     Spacer()
                     ShutterButton(isRecording: camera.isRecording) {
                         camera.isRecording ? camera.stopRecording() : camera.startRecording()
@@ -219,8 +281,10 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
                     }
-                    .disabled(camera.isRecording || camera.isFinalizing)
-                    .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
+                    // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
+                    // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
+                    // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
+                    //  录制键才能打开面板"——见诊断横幅 BTN 行）
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 28)
@@ -233,16 +297,20 @@ struct CameraView: View {
                     GlassIconButton(systemImage: "rectangle.split.2x1") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingFunction = true }
                     }
-                    .disabled(camera.isRecording || camera.isFinalizing)
-                    .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
+                    // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
+                    // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
+                    // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
+                    //  录制键才能打开面板"——见诊断横幅 BTN 行）
                     ShutterButton(isRecording: camera.isRecording) {
                         camera.isRecording ? camera.stopRecording() : camera.startRecording()
                     }
                     GlassIconButton(systemImage: "gearshape.fill") {
                         withAnimation(.spring(response: 0.38, dampingFraction: 0.85)) { showingSettings = true }
                     }
-                    .disabled(camera.isRecording || camera.isFinalizing)
-                    .opacity((camera.isRecording || camera.isFinalizing) ? 0.35 : 1)
+                    // 按钮层不禁用：面板内部行已有 isRecording/isFinalizing 防护
+                    // （录制中改设置 setter 静默 return），保证首次启动面板必能打开
+                    // （真机反复验证：按钮层禁用会因状态机首次快照导致"必须点一次
+                    //  录制键才能打开面板"——见诊断横幅 BTN 行）
                 }
                 .padding(.bottom, 46)
             }
@@ -324,7 +392,7 @@ struct CameraView: View {
                 Text("A:\(status.a) | B:\(status.b)")
                 Text("RUN:\(camera.isSessionRunning ? 1 : 0) REC:\(camera.isRecording ? 1 : 0) FIN:\(camera.isFinalizing ? 1 : 0)")
                 Text("LAY:\(camera.layout == .pictureInPicture ? "PIP" : "SPL") MOD:\(camera.mode == .dualFiles ? "B" : "A")")
-                Text("SET:\(showingSettings ? 1 : 0) FUN:\(showingFunction ? 1 : 0) GEN:\(camera.previewGeneration)")
+                Text("SET:\(showingSettings ? 1 : 0) FUN:\(showingFunction ? 1 : 0) GEN:\(camera.previewGeneration) BTN:\(camera.isRecording || camera.isFinalizing ? 1 : 0)")
             }
             .font(.system(size: 9, weight: .medium, design: .monospaced))
             .foregroundStyle(.yellow)

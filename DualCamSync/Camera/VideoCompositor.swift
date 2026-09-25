@@ -71,11 +71,15 @@ final class VideoCompositor {
         return imageA.composited(over: imageB).cropped(to: target)
     }
 
-    /// 画中画：主画面全屏，副画面悬浮右下角（约占 1/3 边长）
+    /// 画中画：主画面全屏，副画面悬浮右下角。
+    /// 小窗宽度 = 目标宽 × 0.26、高度按目标画面比例——与预览小窗
+    /// （CameraView.pipWindowSize：宽 = 屏宽 × 0.26、高按画面比例）一致，
+    /// 满足需求"模式A合成时小窗大小与预览框一致"；B 路源画面
+    /// aspectFill 铺满小窗即完成"上下内容裁切"。
     private func makePiP(main: CIImage, pip: CIImage, target: CGRect) -> CIImage {
         let mainImage = aspectFill(main, into: target)
         let margin: CGFloat = 24
-        let subWidth = target.width / 3
+        let subWidth = target.width * 0.26
         let subHeight = subWidth * (target.height / target.width)
         let subRect = CGRect(x: target.width - subWidth - margin,
                              y: margin,
