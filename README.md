@@ -11,15 +11,16 @@ iOS 原生双摄像头同时录制 App（SwiftUI + `AVCaptureMultiCamSession` + 
 | 功能 | 说明 |
 |---|---|
 | 任意双镜头组合 | 广角+超广角、广角+长焦、前置+后置…均可，运行时探测硬件能力，不支持的组合自动置灰 |
-| 双路实时预览 | 分屏（竖屏上下/横屏左右）/ 画中画（主全屏+副窗右下角），一键切换 |
+| 双路实时预览 | 分屏（竖屏上下/横屏左右）/ 画中画（主全屏+副窗），一键切换；**PIP 小窗可拖动**、默认位置避开三键控件区 |
 | 每路独立控制 | 点按对焦+点测光、AE/AF 锁定、曝光补偿滑块，A/B 两路互不影响 |
 | 分辨率/帧率 | 4K60 / 4K30 / 1080P60 / 1080P30，全局统一，不支持档位自动置灰 |
-| 杜比视界 | `AVVideoCodecType.dolbyVisionHEVC`，能力探测，不支持自动置灰禁用 |
+| 杜比视界 | 能力探测 + 双条件判据（10-bit 采集格式 + dvhe 编码器），不支持自动置灰禁用，并带防闪退安全阀 |
 | 视频防抖 | A/B 两路分别开启/关闭 |
 | 空间音频 | 双文件模式原生支持（First Order Ambisonics + 立体声兼容轨），自动能力探测 |
-| 录制模式 A | 两路合成为**单条 MP4**（构图跟随录制前预览布局），HEVC + 立体声 AAC |
+| 录制模式 A | 两路合成为**单条 MP4**（构图跟随录制前预览布局，**成片小窗位置 = 录制开始时的预览位置，拍后固定**），HEVC + 立体声 AAC |
 | 录制模式 B | 输出**两条独立 MP4**，同一会话时钟、同一时刻启动，时间戳同源帧级对齐 |
 | 自动保存 | 录制结束自动存入系统相册（仅申请写入权限） |
+| 方向系统 | 横竖屏不锁、录制中锁方向（OrientationLockView）；后置用系统标准角度映射、前置独立映射（iPhone 前置传感器竖装），旋转后画面始终正向 |
 | 异常容错 | 不支持多摄/组合/规格/杜比、权限拒绝、内存压力、设备高温 → 弹窗提示 + 自动降级 + 置灰 |
 
 ---
@@ -106,7 +107,19 @@ open DualCamSync.xcodeproj
 - 合成模式：以真实采集声道数动态创建 AAC 输入（双声道立体声优先），保证写入不失败。
 
 ### 液态玻璃
-- 所有控件统一经 `Views/Glass.swift` 的 `.glassEffect(.regular)` + 大圆角实现，底层双摄画面实时透过玻璃动态模糊折射；菜单弹出/收起使用 `.snappy` 弹簧动画。
+- 所有控件统一经 `Views/Glass.swift` 的 `.glassEffect(.regular)` + 大圆角实现，底层双摄画面实时透过玻璃动态模糊折射；菜单弹出/收起使用 `.spring` 弹簧动画。
+- 玻璃键命中修复：`glassEffect` 的 UIKit 命中层（UIGlassEffectView）在 body 重算后可能不同步，导致按钮收不到触摸；`GlassIconButton` 采用**玻璃装饰与命中载体分离**（玻璃圆纯装饰 `.allowsHitTesting(false)`，普通 Button 承担命中）。
+
+### UI 刷新通道（iOS 26.6.1 真机实测）
+- 普通 `@State` 变化在初始态不触发子树重算（面板打不开、小窗拖不动，第一次点录制键才"一次性补上"）；`@State` 包装的 `@Observable` 属性变化可靠触发刷新。
+- 因此面板开关与小窗位置等 UI 状态全部迁入 `@Observable CameraUIState`，走与 `CameraManager` 相同的可靠刷新通道。
+
+### 方向系统
+- 后置摄像头横屏角度用系统标准映射（`landscapeLeft=180`、`landscapeRight=0`）；前置传感器竖装，用独立映射表（`portrait=0 / 倒置=180 / landscapeLeft=270 / landscapeRight=90`），不从此后置派生。
+- 录制中通过 `OrientationLockView` 锁住开始方向，停止后恢复；旋转后用 `geo.size` 变化 + 延迟方向通知双重兜底同步。
+
+### 镜头枚举
+- 前置镜头（iPhone 17 系列以多个虚拟设备暴露：TrueDepth / WideAngle）在 UI 上**只保留一个"前置"选项**，后置按"位置+镜头类型"去重。
 
 ---
 
@@ -114,7 +127,7 @@ open DualCamSync.xcodeproj
 
 | 项 | 说明 |
 |---|---|
-| 杜比视界 | 双摄多摄会话下绝大多数机型不支持 DV 双路录制，选项自动置灰；合成模式（AVAssetWriter）暂不支持 DV |
+| 杜比视界 | **多摄会话（`AVCaptureMultiCamSession`）不提供 10-bit HDR 采集格式**，所有镜头组合均不可用，选项自动置灰（含防闪退安全阀：编码器不支持 dvhe 时静默回退 HEVC） |
 | 4K60 | 多摄双路 4K60 在多数机型不可用，选项自动置灰；能亮即亮 |
 | 空间音频 | 仅双文件模式（MovieFileOutput 原生支持）；合成模式固定立体声 |
 | 免费签名 | 7 天有效期，到期重签；两台设备共用同一 Apple ID 签名会互相顶掉，请保持单一设备 |
@@ -123,7 +136,8 @@ open DualCamSync.xcodeproj
 
 ## 后续迭代建议
 
-- [ ] 画中画副窗口可拖动/缩放
+- [x] 画中画副窗口可拖动（位置记忆 + 越界 clamp + 录制中固定）
+- [ ] 画中画副窗口缩放
 - [ ] 合成模式接入 iOS 26 的 FOA 空间音频（2×AudioDataOutput + `AVCaptureSpatialAudioMetadataSampleGenerator`）
 - [ ] 录制中实时波形/电平表
 - [ ] 手动 ISO / 快门优先
