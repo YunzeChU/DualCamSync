@@ -2,7 +2,13 @@
 
 iOS 原生双摄像头同时录制 App（SwiftUI + `AVCaptureMultiCamSession` + iOS 26 Liquid Glass 液态玻璃）。
 
-> 最低部署版本 **iOS 26**，使用 **Xcode 26** 编译；所有控件使用原生 `.glassEffect()` 液态玻璃材质（禁止模拟磨砂）。
+> 最低部署版本 **iOS 26**，使用 **Xcode 26** 编译；玻璃控件使用原生 `.glassEffect()` 液态玻璃材质（禁止模拟磨砂）。
+
+[![iOS](https://img.shields.io/badge/iOS-26.0-black)]()
+[![Swift](https://img.shields.io/badge/Swift-5.0-orange)]()
+[![Build](https://img.shields.io/badge/Build-Passing-brightgreen)]()
+[![AI](https://img.shields.io/badge/AI-Developed-6a5acd)]()
+[![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
 ---
 
@@ -12,14 +18,15 @@ iOS 原生双摄像头同时录制 App（SwiftUI + `AVCaptureMultiCamSession` + 
 |---|---|
 | 任意双镜头组合 | 广角+超广角、广角+长焦、前置+后置…均可，运行时探测硬件能力，不支持的组合自动置灰 |
 | 双路实时预览 | 分屏（竖屏上下/横屏左右）/ 画中画（主全屏+副窗），一键切换；**PIP 小窗可拖动**、默认位置避开三键控件区 |
-| 每路独立控制 | 点按对焦+点测光、AE/AF 锁定、曝光补偿滑块，A/B 两路互不影响 |
-| 分辨率/帧率 | 4K60 / 4K30 / 1080P60 / 1080P30，全局统一，不支持档位自动置灰 |
-| 杜比视界 | 能力探测 + 双条件判据（10-bit 采集格式 + dvhe 编码器），不支持自动置灰禁用，并带防闪退安全阀 |
+| 每路独立控制 | 对焦锁定、曝光锁定、曝光补偿滑块（A/B 两路独立，互不影响） |
+| 分辨率/帧率 | 4K30 / 1080P60 / 1080P30，全局统一，不支持档位自动置灰并自动降级（4K60 档已移除：多摄双路 4K60 超出带宽限制） |
+| 杜比视界 | 能力探测 + 双条件判据（10-bit 采集格式 + dvhe 编码器），不支持自动置灰禁用，并带防闪退安全阀（多摄会话不提供 10-bit 采集格式，当前所有镜头组合均不可用，见"已知限制"） |
 | 视频防抖 | A/B 两路分别开启/关闭 |
 | 空间音频 | 双文件模式原生支持（First Order Ambisonics + 立体声兼容轨），自动能力探测 |
 | 录制模式 A | 两路合成为**单条 MP4**（构图跟随录制前预览布局，**成片小窗位置 = 录制开始时的预览位置，拍后固定**），HEVC + 立体声 AAC |
 | 录制模式 B | 输出**两条独立 MP4**，同一会话时钟、同一时刻启动，时间戳同源帧级对齐 |
 | 自动保存 | 录制结束自动存入系统相册（仅申请写入权限） |
+| 拍摄地点 | 开关打开时把拍摄地点写入视频元数据（仅保存在本地相册，不上传；未授权定位则不写入） |
 | 方向系统 | 横竖屏不锁、录制中锁方向（OrientationLockView）；后置用系统标准角度映射、前置独立映射（iPhone 前置传感器竖装），旋转后画面始终正向 |
 | 异常容错 | 不支持多摄/组合/规格/杜比、权限拒绝、内存压力、设备高温 → 弹窗提示 + 自动降级 + 置灰 |
 
@@ -41,14 +48,15 @@ DualCamSync/
     │   ├── ModeBRecorder.swift        #   模式B：双文件（MovieFileOutput）
     │   ├── ModeARecorder.swift        #   模式A：合成单条（AVAssetWriter）
     │   └── VideoCompositor.swift      #   CI 实时合成器（分屏/PiP）
-    ├── Views/                         # SwiftUI 界面（全部液态玻璃）
+    ├── Views/                         # SwiftUI 界面
     │   ├── CameraView.swift           #   主界面 + 横竖屏自适应布局
     │   ├── ControlBar.swift           #   快门/功能键/设置键（玻璃按钮）
     │   ├── FunctionPanel.swift        #   功能面板（镜头/布局/模式/分辨率）
     │   ├── SettingsPanel.swift        #   设置面板
     │   ├── Glass.swift                #   .glassEffect() 统一修饰器
+    │   ├── OrientationLockView.swift  #   录制中锁界面方向
     │   └── PreviewLayerView.swift     #   预览层包装（纯显示，不拦截触摸）
-    ├── Support/                       # 系统监控 / 相册保存
+    ├── Support/                       # 系统监控 / 相册保存 / 方向锁
     └── Resources/Info.plist           # 权限描述文本等
 ```
 
@@ -92,7 +100,7 @@ open DualCamSync.xcodeproj
 ## 关键实现说明
 
 ### 双摄会话
-- 使用 `AVCaptureMultiCamSession`，两路 `AVCaptureDeviceInput` 各自配置 `activeFormat`（分辨率/帧率独立生效）。
+- 使用 `AVCaptureMultiCamSession`，两路 `AVCaptureDeviceInput` 在会话内逐设备配置 `activeFormat`（档位全局统一，两路同规格）。
 - 预览层用 `AVCaptureVideoPreviewLayer(sessionWithNoConnection:)` + **手动** `addConnection`（多摄会话禁止自动建连）。
 - 镜头组合是否支持由 `CameraPairProbe` 用独立会话做 `canAddInput` 探测并缓存，选摄面板据此置灰。
 
@@ -107,7 +115,8 @@ open DualCamSync.xcodeproj
 - 合成模式：以真实采集声道数动态创建 AAC 输入（双声道立体声优先），保证写入不失败。
 
 ### 液态玻璃
-- 所有控件统一经 `Views/Glass.swift` 的 `.glassEffect(.regular)` + 大圆角实现，底层双摄画面实时透过玻璃动态模糊折射；菜单弹出/收起使用 `.spring` 弹簧动画。
+- 玻璃控件经 `Views/Glass.swift` 的 `.glassEffect(.regular)` + 大圆角实现，底层双摄画面实时透过玻璃动态模糊折射；菜单弹出/收起使用 `.spring` 弹簧动画。
+- **面板不套玻璃底**：真机验证 `glassEffect` 背景在面板容器上渲染为胶囊形、`clipShape` 无法裁成圆角矩形，因此 `glassPanel` 不添加背景、也不用任何替代材质，面板内容直接浮在预览画面上。
 - 玻璃键命中修复：`glassEffect` 的 UIKit 命中层（UIGlassEffectView）在 body 重算后可能不同步，导致按钮收不到触摸；`GlassIconButton` 采用**玻璃装饰与命中载体分离**（玻璃圆纯装饰 `.allowsHitTesting(false)`，普通 Button 承担命中）。
 
 ### UI 刷新通道（iOS 26.6.1 真机实测）
@@ -128,7 +137,6 @@ open DualCamSync.xcodeproj
 | 项 | 说明 |
 |---|---|
 | 杜比视界 | **多摄会话（`AVCaptureMultiCamSession`）不提供 10-bit HDR 采集格式**，所有镜头组合均不可用，选项自动置灰（含防闪退安全阀：编码器不支持 dvhe 时静默回退 HEVC） |
-| 4K60 | 多摄双路 4K60 在多数机型不可用，选项自动置灰；能亮即亮 |
 | 空间音频 | 仅双文件模式（MovieFileOutput 原生支持）；合成模式固定立体声 |
 | 免费签名 | 7 天有效期，到期重签；两台设备共用同一 Apple ID 签名会互相顶掉，请保持单一设备 |
 
