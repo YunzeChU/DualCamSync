@@ -807,7 +807,7 @@ final class CameraManager {
             return
         }
         let old = preset
-        guard let fallback = ResolutionPreset.allCases.first(where: {
+        guard let fallback = ResolutionPreset.bestAvailablePreset(supports: {
             CameraPairProbe.shared.supportsPreset(deviceA, $0)
                 && CameraPairProbe.shared.supportsPreset(deviceB, $0)
         }) else { return }

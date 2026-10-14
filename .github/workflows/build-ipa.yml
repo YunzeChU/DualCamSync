@@ -37,6 +37,14 @@ jobs:
       - name: Generate Xcode project
         run: xcodegen generate
 
+      - name: Run unit tests
+        run: |
+          xcodebuild test \
+            -project DualCamSync.xcodeproj \
+            -scheme DualCamSync \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
+            CODE_SIGNING_ALLOWED=NO
+
       - name: Build unsigned app for device
         run: |
           xcodebuild \

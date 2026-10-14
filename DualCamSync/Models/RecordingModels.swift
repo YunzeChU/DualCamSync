@@ -100,3 +100,12 @@ enum CameraSlot: String, CaseIterable, Identifiable {
 
     var displayName: String { rawValue }
 }
+
+// MARK: - 降级选择纯函数（CameraManager.ensurePresetSupported 的纯逻辑封装）
+// 语义与生产内联逻辑一致：按声明顺序（4K30 → 1080P60 → 1080P30，从高到低）
+// 取第一个 supports 判定为 true 的档位；全部不可用时返回 nil（保持原档位）。
+extension ResolutionPreset {
+    static func bestAvailablePreset(supports: (ResolutionPreset) -> Bool) -> ResolutionPreset? {
+        allCases.first(where: supports)
+    }
+}

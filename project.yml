@@ -46,4 +46,17 @@ targets:
         PRODUCT_NAME: DualCamSync
         INFOPLIST_FILE: DualCamSync/Resources/Info.plist
     scheme:
-      gatherCoverageData: false
+      gatherCoverageData: true
+      testTargets:
+        - DualCamSyncTests
+  DualCamSyncTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: DualCamSyncTests
+    dependencies:
+      - target: DualCamSync
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.example.DualCamSyncTests
+        GENERATE_INFOPLIST_FILE: YES
