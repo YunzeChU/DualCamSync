@@ -91,8 +91,10 @@ struct CameraView: View {
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
 
-                // 临时诊断横幅（真机定位用，验证后删除）
+#if DEBUG
+                // 临时诊断横幅（真机定位用，仅 Debug 构建显示；Release 构建已剔除）
                 diagnosticBannerView()
+#endif
             }
             .animation(.spring(response: 0.38, dampingFraction: 0.85), value: ui.showingFunction)
             .animation(.spring(response: 0.38, dampingFraction: 0.85), value: ui.showingSettings)
@@ -454,9 +456,10 @@ struct CameraView: View {
         return String(format: "%02d:%02d", total / 60, total % 60)
     }
 
+#if DEBUG
     /// 临时诊断横幅（真机定位：B 路预览失败原因 / 面板状态是否变化 / 录制状态是否变化）
     /// 用 TimelineView 每秒刷新，避免异步配置完成后横幅仍显示初始快照。
-    /// 每行格式固定，用户拍照/抄录后删除本视图。
+    /// 每行格式固定，仅 Debug 构建显示；Release 构建由 #if DEBUG 剔除。
     @ViewBuilder
     private func diagnosticBannerView() -> some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
@@ -479,4 +482,5 @@ struct CameraView: View {
             .allowsHitTesting(false)
         }
     }
+#endif
 }

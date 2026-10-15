@@ -13,6 +13,10 @@
 
 name: Build IPA (unsigned)
 
+# 显式声明最小权限：仅需读取仓库内容（避免日志下载/徽章访问时的权限报错）
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]

@@ -6,7 +6,7 @@ iOS 原生双摄像头同时录制 App（SwiftUI + `AVCaptureMultiCamSession` + 
 
 [![iOS](https://img.shields.io/badge/iOS-26.0-black)]()
 [![Swift](https://img.shields.io/badge/Swift-5.0-orange)]()
-[![Build](https://img.shields.io/badge/Build-Passing-brightgreen)]()
+[![CI](https://github.com/YunzeChU/DualCamSync/actions/workflows/build-ipa.yml/badge.svg)](https://github.com/YunzeChU/DualCamSync/actions)
 [![AI](https://img.shields.io/badge/AI-Developed-6a5acd)]()
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 
