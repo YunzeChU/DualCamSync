@@ -137,6 +137,16 @@ final class ModeARecorder: NSObject,
             AVVideoCodecKey: AVVideoCodecType.hevc,
             AVVideoWidthKey: outputSize.width,
             AVVideoHeightKey: outputSize.height,
+            // 显式声明输入像素颜色属性（BT.709）：合成器输出的是全范围
+            // BGRA 像素（渲染 colorSpace = sRGB，原色与 BT.709 相同）。
+            // 若不声明，编码器可能按错误矩阵/范围转换（默认 BT.601 +
+            // limited），导致成片偏蓝偏暗、与预览不一致——真机实测
+            // "封面正常、播放偏色"即颜色标记缺失的表现。
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ],
             AVVideoCompressionPropertiesKey: [
                 AVVideoAverageBitRateKey: bitrate,
                 // 不显式指定 profile：交由系统按分辨率/帧率自动选择（HEVC Main/Main10）
@@ -182,9 +192,18 @@ final class ModeARecorder: NSObject,
         self.isRecording = true
     }
 
-    /// 停止录制：标记完成并异步收尾
+    /// 停止录制：等已入队帧写完再收尾（修复"结尾定格"）
+    /// -------------------------------------------------------------
+    /// 合成/写入慢时，A 路视频队列与音频队列会积压已入队的回调样本；
+    /// 若直接置 isRecording=false，这些样本执行时被丢弃 → 视频末尾
+    /// 整段缺失，播放定格在最后一帧（用户实测"最后几秒定格/没录上"）。
+    /// 因此先同步排空两个队列（期间 isRecording 仍为 true，样本正常
+    /// 合成写入），再关闭写入器。stop 由主线程调用，队列工作不依赖
+    /// 主线程，无死锁。
     func stop() {
         guard isRecording else { return }
+        videoQueueA.sync { }
+        audioQueue.sync { }
         isRecording = false
 
         // 没有任何帧写入（例如刚点录制立刻停止）：直接丢弃临时文件

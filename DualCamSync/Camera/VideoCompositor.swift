@@ -55,6 +55,18 @@ final class VideoCompositor {
         // 渲染到像素缓冲（自动 GPU 加速）
         ciContext.render(composed, to: output, bounds: target,
                          colorSpace: CGColorSpaceCreateDeviceRGB())
+        // 显式声明输出像素为 BT.709 全范围 RGB：与 ModeARecorder 的
+        // AVVideoColorPropertiesKey 配套，保证 HEVC 编码器按正确矩阵/范围
+        // 转换颜色（否则成片偏蓝偏暗、与预览不一致）。
+        CVBufferSetAttachment(output, CVImageBufferYCbCrMatrixKey,
+                              kCVImageBufferYCbCrMatrix_ITU_R_709_2 as CFString,
+                              .shouldPropagate)
+        CVBufferSetAttachment(output, CVImageBufferColorPrimariesKey,
+                              kCVImageBufferColorPrimaries_ITU_R_709_2 as CFString,
+                              .shouldPropagate)
+        CVBufferSetAttachment(output, CVImageBufferTransferFunctionKey,
+                              kCVImageBufferTransferFunction_ITU_R_709_2 as CFString,
+                              .shouldPropagate)
         return output
     }
 

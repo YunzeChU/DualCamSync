@@ -1005,6 +1005,13 @@ final class CameraManager {
                                                 failedURLs: failedURLs, token: token)
                 }
             case .composite:
+                // 先启用两路视频 + 音频数据输出连接（source 端开始派发样本，
+                // 供 ModeARecorder 帧配对 + 合成）。用 compositeVideoConnA/B
+                // 精确定位 enabled 的视频连接（connection(with:) 可能返回
+                // 被 constrainDataOutput 关闭的另一路连接）。
+                compositeVideoConnA?.isEnabled = true
+                compositeVideoConnB?.isEnabled = true
+                audioDataOutput?.connection(with: .audio)?.isEnabled = true
                 let target = targetOutputDimensions()
                 try modeARecorder.start(outputSize: target,
                                         layout: layout,
@@ -1038,7 +1045,17 @@ final class CameraManager {
         isRecording = false
         switch mode {
         case .dualFiles: modeBRecorder.stop()
-        case .composite: modeARecorder.stop()
+        case .composite:
+            // 先停两路视频 + 音频数据输出连接（源头断流）：不再派发新样本，
+            // 让 recorder.stop() 的"排空已入队帧"有界可完成——
+            // 若先置 isRecording=false 直接收尾，队列里已入队的末尾帧
+            // 会被丢弃，成片结尾缺帧（真机"最后几秒定格/没录上"）；
+            // 若不断流就排空，合成慢时新帧无限入队，sync 可能永不返回。
+            // 预览层连接独立，不受影响；下次录制 startRecording 重新 enable。
+            compositeVideoConnA?.isEnabled = false
+            compositeVideoConnB?.isEnabled = false
+            audioDataOutput?.connection(with: .audio)?.isEnabled = false
+            modeARecorder.stop()
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
             guard let self, self.isFinalizing else { return }
