@@ -348,7 +348,10 @@ final class ModeARecorder: NSObject,
             if isDraining {
                 // 停止排空：积压 A 帧用 B 滑动历史兜底配对（时间戳最接近
                 // 且窗口 0.1s 内），救回末尾帧；找不到则丢弃该帧。
+                // 注：guard let 的 a/b 在 else 分支内不可见，此处用局部
+                // 元组重建当前 A 帧（内容 = 刚写入 pendingA 的本帧）。
                 pairingLock.unlock()
+                let a = (buffer: pixelBuffer, pts: pts)
                 if let b = nearestB(to: a.pts),
                    abs(a.pts.seconds - b.pts.seconds) < 0.1 {
                     writeComposed(a: a, b: b)
