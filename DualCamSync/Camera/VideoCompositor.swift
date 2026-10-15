@@ -1,3 +1,4 @@
+import CoreGraphics
 import CoreImage
 import CoreVideo
 import Foundation
@@ -18,12 +19,19 @@ final class VideoCompositor {
     private var poolWidth: Int32 = 0
     private var poolHeight: Int32 = 0
 
+    /// 画中画小窗圆角遮罩缓存（尺寸+圆角固定，录制期间复用同一张，不逐帧生成）
+    private var pipMaskCache: (key: String, mask: CIImage)?
+
     /// 合成一帧画面
+    /// - Parameter pipCornerRadiusRatio: 成片小窗圆角半径比例
+    ///   （= 预览小窗圆角 18pt / 预览小窗宽，由 CameraView 录制前写入）。
+    ///   成片圆角 = 成片小窗宽 × ratio，保证与预览圆角视觉等比；传 0 表示不加圆角。
     func composite(frameA: CVPixelBuffer,
                    frameB: CVPixelBuffer,
                    layout: PreviewLayout,
                    landscape: Bool,
                    pipPosition: CGPoint,
+                   pipCornerRadiusRatio: CGFloat,
                    outputWidth: Int32,
                    outputHeight: Int32) -> CVPixelBuffer? {
         let imageA = CIImage(cvPixelBuffer: frameA)
@@ -37,7 +45,8 @@ final class VideoCompositor {
         case .split:
             composed = makeSplit(a: imageA, b: imageB, landscape: landscape, target: target)
         case .pictureInPicture:
-            composed = makePiP(main: imageA, pip: imageB, target: target, pipPosition: pipPosition)
+            composed = makePiP(main: imageA, pip: imageB, target: target,
+                               pipPosition: pipPosition, cornerRadiusRatio: pipCornerRadiusRatio)
         }
 
         guard let output = poolPixelBuffer(width: outputWidth, height: outputHeight) else {
@@ -84,7 +93,12 @@ final class VideoCompositor {
     ///   左下，因此中心 y 需换算为 `(1 - y)`）。录制开始前由 CameraView
     ///   写入预览小窗实际位置，保证"成片小窗位置 = 录制开始时的预览位置"；
     ///   位置做了 clamp，保证小窗完整落在画面内。
-    private func makePiP(main: CIImage, pip: CIImage, target: CGRect, pipPosition: CGPoint) -> CIImage {
+    /// - Parameter cornerRadiusRatio: 小窗圆角半径比例（18 / 预览小窗宽）。
+    ///   预览小窗是圆角矩形（SwiftUI `.clipShape(RoundedRectangle(18))`），
+    ///   成片必须同样圆角才能"预览 = 成片"；Core Image 无路径裁剪，
+    ///   用圆角 alpha 遮罩（CIBlendWithAlphaMask）实现。
+    private func makePiP(main: CIImage, pip: CIImage, target: CGRect,
+                         pipPosition: CGPoint, cornerRadiusRatio: CGFloat) -> CIImage {
         let mainImage = aspectFill(main, into: target)
         let subWidth = target.width * 0.26
         let subHeight = subWidth * (target.height / target.width)
@@ -98,8 +112,55 @@ final class VideoCompositor {
                              y: clampedY - subHeight / 2,
                              width: subWidth,
                              height: subHeight)
-        let pipImage = aspectFill(pip, into: subRect)
+        var pipImage = aspectFill(pip, into: subRect)
+        // 圆角：与预览小窗视觉一致（半径按小窗宽度等比换算）
+        if cornerRadiusRatio > 0 {
+            let radius = subWidth * cornerRadiusRatio
+            let mask = roundedRectMask(size: subRect.size, cornerRadius: radius)
+            // 滤镜输入使用同一坐标系：把 mask（原点 0,0）平移到
+            // pipImage.extent（= subRect）的原点，避免圆角错位
+            let maskShifted = mask.transformed(by: CGAffineTransform(
+                translationX: pipImage.extent.minX, y: pipImage.extent.minY))
+            // 透明背景：圆角外区域显示它（透明 = 露出主画面）
+            let clearBg = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0))
+                .cropped(to: pipImage.extent)
+            pipImage = pipImage.applyingFilter("CIBlendWithAlphaMask", parameters: [
+                kCIInputBackgroundImageKey: clearBg,
+                kCIInputMaskImageKey: maskShifted,
+            ])
+        }
         return pipImage.composited(over: mainImage).cropped(to: target)
+    }
+
+    /// 生成白色圆角矩形遮罩（黑底透明外，供 CIBlendWithAlphaMask 挖圆角）。
+    /// 尺寸+圆角不变时复用缓存，避免每帧重画。
+    private func roundedRectMask(size: CGSize, cornerRadius: CGFloat) -> CIImage {
+        let width = max(Int(size.width.rounded(.up)), 1)
+        let height = max(Int(size.height.rounded(.up)), 1)
+        let radius = min(cornerRadius, CGFloat(min(width, height)) / 2)
+        let key = "\(width)x\(height)-\(Int(radius.rounded()))"
+        if let cache = pipMaskCache, cache.key == key {
+            return cache.mask
+        }
+        var data = [UInt8](repeating: 0, count: width * height * 4)
+        if let ctx = CGContext(data: &data, width: width, height: height,
+                               bitsPerComponent: 8, bytesPerRow: width * 4,
+                               space: CGColorSpaceCreateDeviceRGB(),
+                               bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) {
+            ctx.setFillColor(CGColor(red: 1, green: 1, blue: 1, alpha: 1))
+            let rect = CGRect(x: 0, y: 0, width: CGFloat(width), height: CGFloat(height))
+            ctx.addPath(CGPath(roundedRect: rect,
+                               cornerWidth: radius, cornerHeight: radius, transform: nil))
+            ctx.fillPath()
+            if let cgImage = ctx.makeImage() {
+                let mask = CIImage(cgImage: cgImage)
+                pipMaskCache = (key, mask)
+                return mask
+            }
+        }
+        // 兜底：整块不透明（无圆角，功能仍可用）
+        return CIImage(color: CIColor(red: 1, green: 1, blue: 1, alpha: 1))
+            .cropped(to: CGRect(origin: .zero, size: size))
     }
 
     /// 将图片 aspect-fill 铺满目标矩形（缩放 + 居中裁剪）

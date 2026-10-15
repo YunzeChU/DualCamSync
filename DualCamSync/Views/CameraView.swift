@@ -90,11 +90,6 @@ struct CameraView: View {
                     degradationBannerView(banner)
                         .transition(.move(edge: .top).combined(with: .opacity))
                 }
-
-#if DEBUG
-                // 临时诊断横幅（真机定位用，仅 Debug 构建显示；Release 构建已剔除）
-                diagnosticBannerView()
-#endif
             }
             .animation(.spring(response: 0.38, dampingFraction: 0.85), value: ui.showingFunction)
             .animation(.spring(response: 0.38, dampingFraction: 0.85), value: ui.showingSettings)
@@ -229,12 +224,12 @@ struct CameraView: View {
                         }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity,
-                       alignment: .bottomTrailing)
-                // 默认位置避开三键控件区：竖屏抬高到底部三键之上（190），
-                // 横屏左移避开右侧竖排三键（200）——否则小窗盖住按钮
-                // （按钮虽在上层仍可点，但画面被遮、误触率高）
-                .padding(.bottom, isLandscape ? 24 : 190)
-                .padding(.trailing, isLandscape ? 200 : 24)
+                       alignment: .topLeading)
+                // 默认位置在左上角（用户要求）：竖屏顶 60/左 16、
+                // 横屏顶 24/左 24，均不挡三键控件区，也不与顶部居中的
+                // 红色计时重叠；打开即见，与成片位置一致
+                .padding(.top, isLandscape ? 24 : 60)
+                .padding(.leading, isLandscape ? 24 : 16)
             } else {
                 // 分屏：B 占右/下半
                 previewSlot(.b)
@@ -272,26 +267,28 @@ struct CameraView: View {
     }
 
     /// 计算小窗当前的归一化中心位置（0~1，y 从顶部算，与 SwiftUI 一致）。
-    /// 基准 = 默认避让位置（与 previewArea 的 padding、clampPipOffset 同一套
-    /// 常量），叠加拖动偏移 ui.pipOffset；录制开始前由 controlOverlay 写入
+    /// 基准 = 左上角默认位置（与 previewArea 的 padding、clampPipOffset 同一套
+    /// 常量），叠加拖动偏移；录制开始前由 controlOverlay 写入
     /// camera.pipPosition，模式A合成时 makePiP 按此摆放成片小窗。
     private func currentPipNormalizedPosition(geo: GeometryProxy, isLandscape: Bool) -> CGPoint {
         let size = geo.size
         let window = pipWindowSize(geo, isLandscape)
-        let baseX = size.width - window.width - (isLandscape ? 200 : 24)
-        let baseY = size.height - window.height - (isLandscape ? 24 : 190)
-        let centerX = baseX + ui.pipOffset.width + window.width / 2
-        let centerY = baseY + ui.pipOffset.height + window.height / 2
+        let baseX = isLandscape ? 24 : 16
+        let baseY = isLandscape ? 24 : 60
+        // 归并 pipOffset + 未松手的 pipDragOffset：手指按住没松就点录制时，
+        // 写入的位置也是小窗实际渲染位置（预览 = 成片）
+        let centerX = baseX + ui.pipOffset.width + ui.pipDragOffset.width + window.width / 2
+        let centerY = baseY + ui.pipOffset.height + ui.pipDragOffset.height + window.height / 2
         return CGPoint(x: centerX / size.width, y: centerY / size.height)
     }
 
     /// 把小窗偏移限制在屏内（完整可见，四周留 8pt 边距）
-    /// 基准与 PIP 小窗默认位置一致（竖屏底部三键之上、横屏避开右侧三键），
-    /// 保证拖放手感连续、旋转后 clamp 回到"不遮按钮"的默认区域。
+    /// 基准与 PIP 小窗默认位置一致（左上角：竖屏顶 60/左 16、横屏顶 24/左 24），
+    /// 保证拖放手感连续、旋转后 clamp 回到左上角默认区域。
     private func clampPipOffset(to size: CGSize, window: CGSize, isLandscape: Bool) {
-        // 无偏移时小窗位于默认位置（距底/距右见 previewArea 的 padding）
-        let baseX = size.width - window.width - (isLandscape ? 200 : 24)
-        let baseY = size.height - window.height - (isLandscape ? 24 : 190)
+        // 无偏移时小窗位于左上角默认位置（距顶/距左见 previewArea 的 padding）
+        let baseX = isLandscape ? 24 : 16
+        let baseY = isLandscape ? 24 : 60
         let minOX = 8 - baseX
         let maxOX = (size.width - window.width - 8) - baseX
         let minOY = 8 - baseY
@@ -343,8 +340,10 @@ struct CameraView: View {
                         if camera.isRecording {
                             camera.stopRecording()
                         } else {
-                            // 录制前把当前小窗实际位置写入，成片小窗 = 录制开始位置
+                            // 录制前把当前小窗实际位置与圆角比例写入，
+                            // 成片小窗 = 录制开始时的预览（位置 + 圆角一致）
                             camera.pipPosition = currentPipNormalizedPosition(geo: geo, isLandscape: isLandscape)
+                            camera.pipCornerRadiusRatio = 18 / pipWindowSize(geo, isLandscape).width
                             camera.startRecording()
                         }
                     }
@@ -375,8 +374,10 @@ struct CameraView: View {
                         if camera.isRecording {
                             camera.stopRecording()
                         } else {
-                            // 录制前把当前小窗实际位置写入，成片小窗 = 录制开始位置
+                            // 录制前把当前小窗实际位置与圆角比例写入，
+                            // 成片小窗 = 录制开始时的预览（位置 + 圆角一致）
                             camera.pipPosition = currentPipNormalizedPosition(geo: geo, isLandscape: isLandscape)
+                            camera.pipCornerRadiusRatio = 18 / pipWindowSize(geo, isLandscape).width
                             camera.startRecording()
                         }
                     }
@@ -455,32 +456,4 @@ struct CameraView: View {
         let total = Int(interval)
         return String(format: "%02d:%02d", total / 60, total % 60)
     }
-
-#if DEBUG
-    /// 临时诊断横幅（真机定位：B 路预览失败原因 / 面板状态是否变化 / 录制状态是否变化）
-    /// 用 TimelineView 每秒刷新，避免异步配置完成后横幅仍显示初始快照。
-    /// 每行格式固定，仅 Debug 构建显示；Release 构建由 #if DEBUG 剔除。
-    @ViewBuilder
-    private func diagnosticBannerView() -> some View {
-        TimelineView(.periodic(from: .now, by: 1)) { _ in
-            let status = camera.previewConnStatus
-            VStack(alignment: .leading, spacing: 2) {
-                Text("A:\(status.a) | B:\(status.b)")
-                Text("RUN:\(camera.isSessionRunning ? 1 : 0) REC:\(camera.isRecording ? 1 : 0) FIN:\(camera.isFinalizing ? 1 : 0)")
-                Text("LAY:\(camera.layout == .pictureInPicture ? "PIP" : "SPL") MOD:\(camera.mode == .dualFiles ? "B" : "A")")
-                Text("SET:\(ui.showingSettings ? 1 : 0) FUN:\(ui.showingFunction ? 1 : 0) GEN:\(camera.previewGeneration) BTN:\(camera.isRecording || camera.isFinalizing ? 1 : 0)")
-                Text("ANG A:\(camera.previewAngleA, specifier: "%.0f") M:\(camera.previewMirrorA ? 1 : 0) | B:\(camera.previewAngleB, specifier: "%.0f") M:\(camera.previewMirrorB ? 1 : 0)")
-                Text("PIP:\(Int(ui.pipOffset.width)),\(Int(ui.pipOffset.height))")
-            }
-            .font(.system(size: 9, weight: .medium, design: .monospaced))
-            .foregroundStyle(.yellow)
-            .padding(5)
-            .background(Color.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
-            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-            .padding(.top, 6)
-            .padding(.leading, 6)
-            .allowsHitTesting(false)
-        }
-    }
-#endif
 }

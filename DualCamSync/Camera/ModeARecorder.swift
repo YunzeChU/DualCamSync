@@ -56,6 +56,9 @@ final class ModeARecorder: NSObject,
     /// 在 start 时传入，合成帧时传给 VideoCompositor.makePiP —— 保证
     /// "成片小窗位置 = 录制开始时的预览位置"）
     private var recordingPipPosition: CGPoint = CGPoint(x: 0.805, y: 0.665)
+    /// 录制开始时的画中画小窗圆角比例（成片圆角 = 小窗宽 × 比例，
+    /// 由 CameraManager 在 start 时传入；0 = 不加圆角）
+    private var recordingPipCornerRadiusRatio: CGFloat = 0
     /// 写入会话起点（多队列并发，需加锁保护）
     private let startLock = NSLock()
     private var sessionStartTime: CMTime?
@@ -107,10 +110,13 @@ final class ModeARecorder: NSObject,
     ///     音频首帧的真实 ASBD 创建（见 handleAudioSampleBuffer）。
     ///   - pipPosition: 画中画小窗位置（归一化 0~1，y 从顶部算），
     ///     模式A合成时 makePiP 按此摆放 B 路小窗。
+    ///   - pipCornerRadiusRatio: 成片小窗圆角半径比例（= 预览小窗圆角
+    ///     18pt / 预览小窗宽），保证成片小窗与预览一样是圆角矩形。
     func start(outputSize: (width: Int32, height: Int32),
                layout: PreviewLayout,
                audioFormat: (sampleRate: Double, channels: Int)?,
-               pipPosition: CGPoint) throws {
+               pipPosition: CGPoint,
+               pipCornerRadiusRatio: CGFloat) throws {
         guard !isRecording else {
             // 静默返回 = 录制键点了毫无反应；必须抛错让上层弹窗说明
             throw CameraError.recordingFailed("上一段视频仍在收尾，请稍候")
@@ -164,6 +170,7 @@ final class ModeARecorder: NSObject,
         self.recordingLayout = layout
         self.recordingLandscape = outputSize.width > outputSize.height
         self.recordingPipPosition = pipPosition
+        self.recordingPipCornerRadiusRatio = pipCornerRadiusRatio
         self.sessionStartTime = nil
         self.isWriting = false
         self.audioWriterInput = nil
@@ -296,6 +303,7 @@ final class ModeARecorder: NSObject,
                                                   layout: recordingLayout,
                                                   landscape: recordingLandscape,
                                                   pipPosition: recordingPipPosition,
+                                                  pipCornerRadiusRatio: recordingPipCornerRadiusRatio,
                                                   outputWidth: outputSize.width,
                                                   outputHeight: outputSize.height),
               let adaptor = pixelAdaptor,

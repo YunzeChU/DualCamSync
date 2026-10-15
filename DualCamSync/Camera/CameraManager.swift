@@ -965,6 +965,11 @@ final class CameraManager {
     /// 距右 24，屏 390×844 下中心 ≈ (0.80, 0.66)），录制前总是被覆盖。
     var pipPosition: CGPoint = CGPoint(x: 0.805, y: 0.665)
 
+    /// 画中画小窗圆角半径比例（= 预览小窗圆角 18pt / 预览小窗宽）。
+    /// 录制开始前由 CameraView 写入，模式A合成时成片小窗圆角
+    /// = 成片小窗宽 × 比例，与预览圆角视觉等比（预览 = 成片）。
+    var pipCornerRadiusRatio: CGFloat = 0
+
     /// 开始录制：按当前布局/方向/规格启动对应录制器
     func startRecording() {
         guard !isRecording, !isFinalizing, isMultiCamSupported, cameraA != nil, cameraB != nil else {
@@ -1004,7 +1009,8 @@ final class CameraManager {
                 try modeARecorder.start(outputSize: target,
                                         layout: layout,
                                         audioFormat: microphoneAudioFormat(),
-                                        pipPosition: pipPosition)
+                                        pipPosition: pipPosition,
+                                        pipCornerRadiusRatio: pipCornerRadiusRatio)
                 modeARecorder.onFinished = { [weak self] urls in
                     self?.handleRecordingFinished(urls: urls, token: token)
                 }
