@@ -69,6 +69,23 @@ final class ModeARecorder: NSObject,
     private var pendingA: (buffer: CVPixelBuffer, pts: CMTime)?
     private var pendingB: (buffer: CVPixelBuffer, pts: CMTime)?
 
+    /// B 路滑动历史（最近 N 帧）：停止排空期给"时间戳落后于实时 pendingB"
+    /// 的积压 A 帧兜底配对。内存约束：4K BGRA 帧约 33MB，窗口只留 6 帧
+    /// （0.2s），配合"积压自适应降级"（连续配对失败即关圆角）保证积压
+    /// 不超过该窗口。录制结束即清空，释放对相机缓冲池的引用。
+    private var bHistory: [(buffer: CVPixelBuffer, pts: CMTime)] = []
+    private let bHistoryLimit = 6
+
+    /// 停止排空标志（主线程写、A 队列读，经 pairingLock 保护）：
+    /// 为 true 时配对失败改用 B 滑动历史兜底，把末尾帧写进文件。
+    private var draining = false
+
+    /// 积压自适应降级：A 路连续配对失败达到阈值（合成跟不上生产、队列
+    /// 积压）时置位，成片小窗临时不加圆角——合成开销回落到与
+    /// "9月无圆角版本"同等水平，消除积压源头。录制内不复位（防抖动）。
+    private var consecutivePairFailures = 0
+    private var performanceDegraded = false
+
     /// 启动协调：视频首帧就绪后，最多等待音频首帧 audioStartTimeout 秒
     /// （为按"音频真实声道数"懒创建音轨；超时则放弃音轨直接开写）。
     private var videoReady = false
@@ -186,24 +203,40 @@ final class ModeARecorder: NSObject,
         self.audioWriterInput = nil
         self.pendingA = nil
         self.pendingB = nil
+        self.bHistory.removeAll(keepingCapacity: false)
+        self.draining = false
+        self.consecutivePairFailures = 0
+        self.performanceDegraded = false
         self.videoReady = false
         self.audioReady = (audioFormat == nil)   // 无麦克风 → 无需等待音频
         self.videoFirstArrival = nil
         self.isRecording = true
     }
 
-    /// 停止录制：等已入队帧写完再收尾（修复"结尾定格"）
+    /// 停止录制：先排空已入队样本（期间 isRecording 仍为 true），再收尾
     /// -------------------------------------------------------------
-    /// 合成/写入慢时，A 路视频队列与音频队列会积压已入队的回调样本；
-    /// 若直接置 isRecording=false，这些样本执行时被丢弃 → 视频末尾
-    /// 整段缺失，播放定格在最后一帧（用户实测"最后几秒定格/没录上"）。
-    /// 因此先同步排空两个队列（期间 isRecording 仍为 true，样本正常
-    /// 合成写入），再关闭写入器。stop 由主线程调用，队列工作不依赖
-    /// 主线程，无死锁。
+    /// 修复"结尾定格/最后几秒拍不到"（真机实测：合成/写入慢时 A 路视频
+    /// 队列与音频队列会积压已入队的回调样本；若直接置 isRecording=false，
+    /// 这些样本执行时被丢弃 → 视频末尾整段缺失）。
+    ///
+    /// 停止时序（由 CameraManager.stopRecording 先断开 A/B/音频输出连接）：
+    ///   1. 置 draining=true：videoQueueA.sync 排空 A 路积压帧。积压帧的
+    ///      时间戳落后于实时，正常配对必然失败，改用 B 路滑动历史
+    ///      兜底配对写入（见 handleVideoSampleBuffer/nearestB）；
+    ///   2. audioQueue.sync 排空音频（与视频末尾时间对齐）；
+    ///   3. draining=false、isRecording=false，markAsFinished + finishWriting。
+    /// 队列任务不依赖主线程，主线程 sync 等待无死锁；连接已断流，
+    /// 排空期间无新样本入队，队列有界。
     func stop() {
         guard isRecording else { return }
+        pairingLock.lock()
+        draining = true
+        pairingLock.unlock()
         videoQueueA.sync { }
         audioQueue.sync { }
+        pairingLock.lock()
+        draining = false
+        pairingLock.unlock()
         isRecording = false
 
         // 没有任何帧写入（例如刚点录制立刻停止）：直接丢弃临时文件
@@ -245,6 +278,8 @@ final class ModeARecorder: NSObject,
         outputURL = nil
         sessionStartTime = nil
         isWriting = false
+        // 释放 B 路滑动历史对相机缓冲池的引用（4K 帧约 33MB/帧）
+        bHistory.removeAll(keepingCapacity: false)
     }
 
     /// 估算码率：1080P 约 12Mbps，4K 约 35Mbps，保证画质与体积平衡
@@ -271,11 +306,18 @@ final class ModeARecorder: NSObject,
     /// 视频回调：两路帧配对后合成一帧写入
     /// -------------------------------------------------------------
     /// 串行化设计（修复合成+写入并发）：
-    ///   - B 路（videoQueueB）：只更新配对缓冲，不做合成/写入；
+    ///   - B 路（videoQueueB）：只更新配对缓冲 + 滑动历史，不做合成/写入；
     ///   - A 路（videoQueueA）：独占"配对 → 清空缓冲 → 合成 → append"，
     ///     保证 CIContext.render 与 AVAssetWriter append 永远只在单条
     ///     串行队列上执行，不会并发。
     ///   - 配对成功后立即清空 pendingA/B，防止旧帧被重复配对。
+    ///   - 配对失败分两种处理：
+    ///       * 正常录制中（!draining）：连续失败说明合成跟不上生产、
+    ///         A 队列积压（积压帧时间落后于实时 B，0.1s 窗口永远配不上），
+    ///         达到阈值后触发"积压自适应降级"——临时关闭成片小窗圆角，
+    ///         合成开销回到 9 月无圆角版本水平，从源头消除积压；
+    ///       * 停止排空期（draining）：用 B 路滑动历史里时间最近的帧
+    ///         兜底配对，把已积压的末尾帧救回文件（修"结尾定格"）。
     private func handleVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer,
                                         connection: AVCaptureConnection) {
         guard isRecording,
@@ -285,10 +327,14 @@ final class ModeARecorder: NSObject,
         let isB = (connection === videoConnB)
         guard isA || isB else { return }
 
-        // B 路：只写配对缓冲（加锁），让 A 路队列串行消费
+        // B 路：只写配对缓冲 + 滑动历史（加锁），让 A 路队列串行消费
         if isB {
             pairingLock.lock()
             pendingB = (pixelBuffer, pts)
+            bHistory.append((pixelBuffer, pts))
+            if bHistory.count > bHistoryLimit {
+                bHistory.removeFirst(bHistory.count - bHistoryLimit)
+            }
             pairingLock.unlock()
             return
         }
@@ -298,16 +344,37 @@ final class ModeARecorder: NSObject,
         pendingA = (pixelBuffer, pts)
         guard let a = pendingA, let b = pendingB,
               abs(a.pts.seconds - b.pts.seconds) < 0.1 else {
-            pairingLock.unlock()
+            let isDraining = draining
+            if isDraining {
+                // 停止排空：积压 A 帧用 B 滑动历史兜底配对（时间戳最接近
+                // 且窗口 0.1s 内），救回末尾帧；找不到则丢弃该帧。
+                pairingLock.unlock()
+                if let b = nearestB(to: a.pts),
+                   abs(a.pts.seconds - b.pts.seconds) < 0.1 {
+                    writeComposed(a: a, b: b)
+                }
+            } else {
+                // 正常录制中配对失败 = 合成/写入跟不上的积压信号
+                consecutivePairFailures += 1
+                if consecutivePairFailures >= 6, !performanceDegraded {
+                    performanceDegraded = true
+                }
+                pairingLock.unlock()
+            }
             return
         }
-        // 消费：清空配对缓冲，防止旧帧被重复配对
+        // 配对成功：消费缓冲，防止旧帧被重复配对
+        consecutivePairFailures = 0
         pendingA = nil
         pendingB = nil
-        let frameTime = a.pts
-        let bufferA = a.buffer
-        let bufferB = b.buffer
         pairingLock.unlock()
+        writeComposed(a: a, b: b)
+    }
+
+    /// 配对后统一走"标记就绪 → 启动会话 → 合成 → 写入"（A 路串行队列上）
+    private func writeComposed(a: (buffer: CVPixelBuffer, pts: CMTime),
+                               b: (buffer: CVPixelBuffer, pts: CMTime)) {
+        let frameTime = a.pts
 
         // 标记视频就绪（供启动协调等待音频建轨；首帧时间记作等待起点）
         startLock.lock()
@@ -317,17 +384,33 @@ final class ModeARecorder: NSObject,
 
         startSessionIfNeeded(at: frameTime)
 
-        guard let composed = compositor.composite(frameA: bufferA,
-                                                  frameB: bufferB,
+        // 积压自适应降级：合成跟不上时临时关圆角（仅本段录制生效）
+        let cornerRatio = performanceDegraded ? 0 : recordingPipCornerRadiusRatio
+        guard let composed = compositor.composite(frameA: a.buffer,
+                                                  frameB: b.buffer,
                                                   layout: recordingLayout,
                                                   landscape: recordingLandscape,
                                                   pipPosition: recordingPipPosition,
-                                                  pipCornerRadiusRatio: recordingPipCornerRadiusRatio,
+                                                  pipCornerRadiusRatio: cornerRatio,
                                                   outputWidth: outputSize.width,
                                                   outputHeight: outputSize.height),
               let adaptor = pixelAdaptor,
               adaptor.assetWriterInput.isReadyForMoreMediaData else { return }
         adaptor.append(composed, withPresentationTime: frameTime)
+    }
+
+    /// 从 B 路滑动历史里找时间戳最接近的帧（停止排空期兜底配对用）
+    private func nearestB(to pts: CMTime) -> (buffer: CVPixelBuffer, pts: CMTime)? {
+        var best: (buffer: CVPixelBuffer, pts: CMTime)?
+        var bestDiff = Double.greatestFiniteMagnitude
+        for entry in bHistory {
+            let diff = abs(entry.pts.seconds - pts.seconds)
+            if diff < bestDiff {
+                bestDiff = diff
+                best = entry
+            }
+        }
+        return best
     }
 
     /// 音频回调：按真实声道数懒创建 AAC 音轨并写入
