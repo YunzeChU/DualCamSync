@@ -273,8 +273,8 @@ struct CameraView: View {
     private func currentPipNormalizedPosition(geo: GeometryProxy, isLandscape: Bool) -> CGPoint {
         let size = geo.size
         let window = pipWindowSize(geo, isLandscape)
-        let baseX = isLandscape ? 24 : 16
-        let baseY = isLandscape ? 24 : 60
+        let baseX: CGFloat = isLandscape ? 24 : 16
+        let baseY: CGFloat = isLandscape ? 24 : 60
         // 归并 pipOffset + 未松手的 pipDragOffset：手指按住没松就点录制时，
         // 写入的位置也是小窗实际渲染位置（预览 = 成片）
         let centerX = baseX + ui.pipOffset.width + ui.pipDragOffset.width + window.width / 2
@@ -287,8 +287,8 @@ struct CameraView: View {
     /// 保证拖放手感连续、旋转后 clamp 回到左上角默认区域。
     private func clampPipOffset(to size: CGSize, window: CGSize, isLandscape: Bool) {
         // 无偏移时小窗位于左上角默认位置（距顶/距左见 previewArea 的 padding）
-        let baseX = isLandscape ? 24 : 16
-        let baseY = isLandscape ? 24 : 60
+        let baseX: CGFloat = isLandscape ? 24 : 16
+        let baseY: CGFloat = isLandscape ? 24 : 60
         let minOX = 8 - baseX
         let maxOX = (size.width - window.width - 8) - baseX
         let minOY = 8 - baseY
