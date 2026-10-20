@@ -46,20 +46,13 @@ final class VideoCompositor {
             ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
             : kCVPixelFormatType_32BGRA
 
-        let imageA: CIImage
-        let imageB: CIImage
-        if isHDR, let hlg = CGColorSpace(name: CGColorSpace.itur_2100_HLG) {
-            // HDR 链路显式声明 HLG 色彩空间（保险）：连接色域是否把
-            // BT.2020/HLG 颜色附件写进 sample buffer 由系统决定；若附件
-            // 缺失，CIImage 会按 sRGB 错误解释 10-bit 帧导致成片提亮/偏色。
-            // 显式设置与 setActiveColorSpace 语义一致；附件存在时覆盖为
-            // 同值，无副作用。
-            imageA = CIImage(cvPixelBuffer: frameA).settingColorSpace(hlg)
-            imageB = CIImage(cvPixelBuffer: frameB).settingColorSpace(hlg)
-        } else {
-            imageA = CIImage(cvPixelBuffer: frameA)
-            imageB = CIImage(cvPixelBuffer: frameB)
-        }
+        // 色彩空间依赖 sample buffer 自带附件：设备 activeColorSpace 已切
+        // HLG/BT.2020（applyFormat 设备级设置），P010 帧应携带正确颜色
+        // 附件供 CIImage 推断；render 时再以 HLG 为工作空间兜底（下方
+        // colorSpace 参数）。CIImage 无 settingColorSpace API（曾误用，
+        // 见 CI 修复记录）。
+        let imageA = CIImage(cvPixelBuffer: frameA)
+        let imageB = CIImage(cvPixelBuffer: frameB)
         let target = CGRect(x: 0, y: 0,
                             width: CGFloat(outputWidth),
                             height: CGFloat(outputHeight))

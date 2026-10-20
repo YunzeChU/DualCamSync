@@ -517,13 +517,15 @@ final class CameraManager {
         let duration = CMTime(value: 1, timescale: CMTimeScale(preset.fps))
         device.activeVideoMinFrameDuration = duration
         device.activeVideoMaxFrameDuration = duration
-        // 杜比：显式使能硬件 HDR 采集（仅 10-bit 格式下有意义；多摄下
-        // 防止系统自动降回 SDR 采集）。与系统相机同源行为。
-        if dolbyVisionEnabled,
-           is10BitFormat(format),
-           device.isVideoHDRSupported {
-            device.setAutomaticallyAdjustsVideoHDREnabled(false)
-            device.videoHDREnabled = true
+        // 杜比：显式使能硬件 HDR 采集并切 HLG/BT.2020 色域。色域是设备级
+        // 属性（AVCaptureDevice.activeColorSpace，AVCaptureConnection 无
+        // setActiveColorSpace），必须与 activeFormat 一起在 lock 内设置、
+        // commit 前完成。10-bit 格式存在即 HDR 能力，无需额外支持性查询
+        // （AVCaptureDevice 无 isVideoHDRSupported API）。多摄下防止系统
+        // 自动降回 SDR 采集，与系统相机同源行为。
+        if dolbyVisionEnabled, is10BitFormat(format) {
+            device.activeColorSpace = .hlgBT2020
+            device.isVideoHDREnabled = true
         }
         device.unlockForConfiguration()
     }
@@ -578,27 +580,9 @@ final class CameraManager {
         constrainMovieOutput(outA, keep: cameraA)
         constrainMovieOutput(outB, keep: cameraB)
 
-        // 杜比：录像连接显式切 HLG/BT.2020 色域（与 applyFormat 切好的
-        // 10-bit 格式 + applyOutputCodec 的 dvhe 编码器配套，保证编码
-        // 颜色空间正确；漏掉会产出颜色标记缺失/偏色的 HDR 文件）。
-        // 条件与 refreshDolbyCapability 的最终可用性完全同源（格式 +
-        // dvhe 编码器支持）：能力不足时**不设色域**，避免"实际以 SDR
-        // 录制但连接带 HLG 颜色标记"的成片偏色。必须在 commit 前
-        // （本函数在 beginConfiguration 内）设置。
-        let useDolbyB = dolbyVisionEnabled
-            && hdrFormatAvailable()
-            && [outA, outB].allSatisfy {
-                $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec)
-            }
-        if useDolbyB {
-            for conn in outA.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
-                try? conn.setActiveColorSpace(.hlgBT2020)
-            }
-            for conn in outB.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
-                try? conn.setActiveColorSpace(.hlgBT2020)
-            }
-        }
-
+        // 杜比色域/10-bit 由 applyFormat 在设备级完成（activeColorSpace +
+        // activeFormat 同锁设置）；dvhe 编码器由 refreshDolbyCapability
+        // 按可用性设置（applyOutputCodec），此处无需连接级配置。
         modeBRecorder.attach(outputA: outA, outputB: outB)
         // 录制完成/失败回调由 startRecording 按"收尾代际"统一设置
         // （attach 阶段不设：回调只在本轮录制触发，且需捕获当时的 token）
@@ -670,15 +654,6 @@ final class CameraManager {
         // 每个数据输出同样会自动为两路视频建连：关闭不属于自己的那路
         compositeVideoConnA = constrainDataOutput(outA, keep: cameraA)
         compositeVideoConnB = constrainDataOutput(outB, keep: cameraB)
-
-        // 杜比：数据输出连接显式切 HLG/BT.2020 色域（与 10-bit 格式配套，
-        // 采集到带 HDR 颜色信息的 P010）。必须在 commit 前（attach 在
-        // beginConfiguration 内）设置；不支持时静默（try?），由
-        // refreshDolbyCapability 的格式探测兜底关闭。
-        if useHDR {
-            if let conn = compositeVideoConnA { try? conn.setActiveColorSpace(.hlgBT2020) }
-            if let conn = compositeVideoConnB { try? conn.setActiveColorSpace(.hlgBT2020) }
-        }
 
         modeARecorder.attach(videoOutputA: outA, videoOutputB: outB,
                              audioOutput: outAudio,
@@ -790,13 +765,13 @@ final class CameraManager {
     /// 判据（全部满足才可用）：
     ///  1. 当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 采集格式；
     /// 当前档位两路是否都有 10-bit HDR 采集格式（杜比判定核心条件；
-    /// 与 applyFormat 实际切到的格式 + videoHDREnabled 守卫完全同源）
+    /// 与 applyFormat 实际切到的格式完全同源。10-bit 格式存在即设备
+    /// HDR 能力——AVCaptureDevice 无独立 isVideoHDRSupported API）
     private func hdrFormatAvailable() -> Bool {
         guard let camA = cameraA, let camB = cameraB else { return false }
         let dims = preset.landscapeDimensions
         return [camA.device, camB.device].allSatisfy {
-            $0.isVideoHDRSupported
-                && findHDRFormat(for: $0, width: dims.width, height: dims.height) != nil
+            findHDRFormat(for: $0, width: dims.width, height: dims.height) != nil
         }
     }
 
@@ -808,12 +783,13 @@ final class CameraManager {
     ///     双文件：MovieFileOutput 可用编码器列表确实含 dvhe；
     ///     合成：AVAssetWriter 走 HEVC Main10 + HDR 属性（无 dvhe 编码器
     ///     概念），只需数据输出支持 P010 像素格式。
-    /// 双条件与 applyFormat（切 10-bit）、attachCompositeOutputs（请求 P010）、
-    /// applyOutputCodec（设 dvhe）行为完全一致，避免"判据说支持、实际切不了/
-    /// 设不了"的错配——错配会让 setOutputSettings(dvhe) 在 8-bit 连接上抛
-    /// NSException（真机崩溃报告实锤）。
-    /// setOutputSettings / setActiveColorSpace 必须在会话配置阶段（commit 前）
-    /// 调用，运行中调用会闪退。
+    /// 双条件与 applyFormat（切 10-bit + 设备 HLG 色域）、
+    /// attachCompositeOutputs（请求 P010）、applyOutputCodec（设 dvhe）
+    /// 行为完全一致，避免"判据说支持、实际切不了/设不了"的错配——错配
+    /// 会让 setOutputSettings(dvhe) 在 8-bit 连接上抛 NSException（真机
+    /// 崩溃报告实锤）。
+    /// setOutputSettings 与设备 activeFormat/activeColorSpace 都必须在
+    /// 会话配置阶段（commit 前）完成，运行中调用会闪退。
     private func refreshDolbyCapability() {
         guard cameraA != nil, cameraB != nil else {
             let wasAvailable = isDolbyVisionAvailable
