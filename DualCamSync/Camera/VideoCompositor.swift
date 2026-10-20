@@ -18,6 +18,7 @@ final class VideoCompositor {
     private var pool: CVPixelBufferPool?
     private var poolWidth: Int32 = 0
     private var poolHeight: Int32 = 0
+    private var poolFormat: OSType = 0
 
     /// 画中画小窗圆角遮罩缓存（尺寸+圆角固定，录制期间复用同一张，不逐帧生成）
     private var pipMaskCache: (key: String, mask: CIImage)?
@@ -26,6 +27,9 @@ final class VideoCompositor {
     /// - Parameter pipCornerRadiusRatio: 成片小窗圆角半径比例
     ///   （= 预览小窗圆角 18pt / 预览小窗宽，由 CameraView 录制前写入）。
     ///   成片圆角 = 成片小窗宽 × ratio，保证与预览圆角视觉等比；传 0 表示不加圆角。
+    /// - 像素格式自适应：输入为 10-bit（P010）时全程在 10-bit 域合成，
+    ///   输出同格式 P010 并挂 BT.2020/HLG 附件（杜比链路，不落 8-bit）；
+    ///   否则维持现有 BGRA + BT.709（SDR 链路）。
     func composite(frameA: CVPixelBuffer,
                    frameB: CVPixelBuffer,
                    layout: PreviewLayout,
@@ -34,8 +38,28 @@ final class VideoCompositor {
                    pipCornerRadiusRatio: CGFloat,
                    outputWidth: Int32,
                    outputHeight: Int32) -> CVPixelBuffer? {
-        let imageA = CIImage(cvPixelBuffer: frameA)
-        let imageB = CIImage(cvPixelBuffer: frameB)
+        // 杜比判定：输入是否为 10-bit YCbCr（P010 VideoRange / FullRange）
+        let inputFormat = CVPixelBufferGetPixelFormatType(frameA)
+        let isHDR = inputFormat == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            || inputFormat == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+        let outFormat: OSType = isHDR
+            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            : kCVPixelFormatType_32BGRA
+
+        let imageA: CIImage
+        let imageB: CIImage
+        if isHDR, let hlg = CGColorSpace(name: CGColorSpace.itur_2100_HLG) {
+            // HDR 链路显式声明 HLG 色彩空间（保险）：连接色域是否把
+            // BT.2020/HLG 颜色附件写进 sample buffer 由系统决定；若附件
+            // 缺失，CIImage 会按 sRGB 错误解释 10-bit 帧导致成片提亮/偏色。
+            // 显式设置与 setActiveColorSpace 语义一致；附件存在时覆盖为
+            // 同值，无副作用。
+            imageA = CIImage(cvPixelBuffer: frameA).settingColorSpace(hlg)
+            imageB = CIImage(cvPixelBuffer: frameB).settingColorSpace(hlg)
+        } else {
+            imageA = CIImage(cvPixelBuffer: frameA)
+            imageB = CIImage(cvPixelBuffer: frameB)
+        }
         let target = CGRect(x: 0, y: 0,
                             width: CGFloat(outputWidth),
                             height: CGFloat(outputHeight))
@@ -49,24 +73,45 @@ final class VideoCompositor {
                                pipPosition: pipPosition, cornerRadiusRatio: pipCornerRadiusRatio)
         }
 
-        guard let output = poolPixelBuffer(width: outputWidth, height: outputHeight) else {
+        guard let output = poolPixelBuffer(width: outputWidth, height: outputHeight,
+                                           format: outFormat) else {
             return nil
         }
-        // 渲染到像素缓冲（自动 GPU 加速）
-        ciContext.render(composed, to: output, bounds: target,
-                         colorSpace: CGColorSpaceCreateDeviceRGB())
-        // 显式声明输出像素为 BT.709 全范围 RGB：与 ModeARecorder 的
-        // AVVideoColorPropertiesKey 配套，保证 HEVC 编码器按正确矩阵/范围
-        // 转换颜色（否则成片偏蓝偏暗、与预览不一致）。
-        CVBufferSetAttachment(output, kCVImageBufferYCbCrMatrixKey,
-                              kCVImageBufferYCbCrMatrix_ITU_R_709_2 as CFString,
-                              .shouldPropagate)
-        CVBufferSetAttachment(output, kCVImageBufferColorPrimariesKey,
-                              kCVImageBufferColorPrimaries_ITU_R_709_2 as CFString,
-                              .shouldPropagate)
-        CVBufferSetAttachment(output, kCVImageBufferTransferFunctionKey,
-                              kCVImageBufferTransferFunction_ITU_R_709_2 as CFString,
-                              .shouldPropagate)
+        // 渲染到像素缓冲（自动 GPU 加速）。
+        // HDR 链路：输入/输出同为 HLG/BT.2020 色彩空间，用 HLG 色彩空间
+        // 做工作空间，避免 8-bit/错误色彩空间中间转换导致偏色。
+        let colorSpace: CGColorSpace = isHDR
+            ? (CGColorSpace(name: CGColorSpace.itur_2100_HLG) ?? CGColorSpaceCreateDeviceRGB())
+            : CGColorSpaceCreateDeviceRGB()
+        ciContext.render(composed, to: output, bounds: target, colorSpace: colorSpace)
+
+        if isHDR {
+            // 10-bit HDR 输出：声明 BT.2020 色原/矩阵 + HLG 传递函数，
+            // 与 ModeARecorder 的 AVVideoColorPropertiesKey 配套，编码器
+            // 按正确 HDR 颜色转换（否则 HDR 成片偏色/被当 SDR 解码）。
+            CVBufferSetAttachment(output, kCVImageBufferYCbCrMatrixKey,
+                                  kCVImageBufferYCbCrMatrix_ITU_R_2020 as CFString,
+                                  .shouldPropagate)
+            CVBufferSetAttachment(output, kCVImageBufferColorPrimariesKey,
+                                  kCVImageBufferColorPrimaries_ITU_R_2020 as CFString,
+                                  .shouldPropagate)
+            CVBufferSetAttachment(output, kCVImageBufferTransferFunctionKey,
+                                  kCVImageBufferTransferFunction_ITU_R_2100_HLG as CFString,
+                                  .shouldPropagate)
+        } else {
+            // 显式声明输出像素为 BT.709 全范围 RGB：与 ModeARecorder 的
+            // AVVideoColorPropertiesKey 配套，保证 HEVC 编码器按正确矩阵/范围
+            // 转换颜色（否则成片偏蓝偏暗、与预览不一致）。
+            CVBufferSetAttachment(output, kCVImageBufferYCbCrMatrixKey,
+                                  kCVImageBufferYCbCrMatrix_ITU_R_709_2 as CFString,
+                                  .shouldPropagate)
+            CVBufferSetAttachment(output, kCVImageBufferColorPrimariesKey,
+                                  kCVImageBufferColorPrimaries_ITU_R_709_2 as CFString,
+                                  .shouldPropagate)
+            CVBufferSetAttachment(output, kCVImageBufferTransferFunctionKey,
+                                  kCVImageBufferTransferFunction_ITU_R_709_2 as CFString,
+                                  .shouldPropagate)
+        }
         return output
     }
 
@@ -197,20 +242,22 @@ final class VideoCompositor {
             .cropped(to: cropRect)
     }
 
-    // MARK: - 输出缓冲池（避免每帧分配内存）
+    // MARK: - 输出缓冲池（避免每帧分配内存；按像素格式分区缓存）
 
-    private func poolPixelBuffer(width: Int32, height: Int32) -> CVPixelBuffer? {
-        if pool == nil || poolWidth != width || poolHeight != height {
+    private func poolPixelBuffer(width: Int32, height: Int32,
+                                 format: OSType) -> CVPixelBuffer? {
+        if pool == nil || poolWidth != width || poolHeight != height || poolFormat != format {
             pool = nil
             let attributes: [String: Any] = [
                 kCVPixelBufferPoolMinimumBufferCountKey as String: 4,
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: format,
                 kCVPixelBufferWidthKey as String: width,
                 kCVPixelBufferHeightKey as String: height,
             ]
             CVPixelBufferPoolCreate(nil, nil, attributes as CFDictionary, &pool)
             poolWidth = width
             poolHeight = height
+            poolFormat = format
         }
         guard let pool else { return nil }
         var pixelBuffer: CVPixelBuffer?

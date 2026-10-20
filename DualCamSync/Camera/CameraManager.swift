@@ -106,6 +106,12 @@ final class CameraManager {
     private var audioDataOutput: AVCaptureAudioDataOutput?
     private var compositeVideoConnA: AVCaptureConnection?
     private var compositeVideoConnB: AVCaptureConnection?
+    /// 本次会话合成输出是否实际为 10-bit HDR（attachCompositeOutputs 按
+    /// "开关 && 格式可用"确定并记录）。录制时 ModeARecorder 以此决定杜比
+    /// 写入——不能直接用 dolbyVisionEnabled：开关可能在同一次配置中被
+    /// refreshDolbyCapability 自动关闭，而会话已是 10-bit；此时若按 SDR
+    /// 启动（BGRA adaptor）接 P010 帧会导致 append 失败/黑帧。
+    private(set) var compositeOutputIsHDR = false
     private let modeARecorder = ModeARecorder()
 
     /// 当前模式下的两路"录制用"视频连接（防抖/旋转统一入口）
@@ -197,6 +203,10 @@ final class CameraManager {
         }
 
         discoverCameras()
+        // 恢复上次设置（镜头按 uniqueID 从可用列表找回；找不到保持 nil，
+        // 由 pickDefaultCameras 兜底）。标量档位等由 applyConfiguration
+        // 内的 ensurePresetSupported 在设备不支持下自动降级。
+        restoreSettings()
         if cameraA == nil || cameraB == nil { pickDefaultCameras() }
 
         requestPermissions { [weak self] granted in
@@ -349,6 +359,10 @@ final class CameraManager {
             session.commitConfiguration()
             session.startRunning()
             refreshCapabilities()
+            // 恢复的对焦锁/曝光锁/曝光补偿在此应用到设备（startRunning 后
+            // 设置设备属性不需要重配会话；保证 UI 状态与设备一致——否则
+            // 二次启动后 UI 显示"已锁定/EV+1.0"而设备实际没锁/没补偿）
+            restoreDeviceCaptureStates()
             // 杜比的 10-bit HDR 格式已在 applyFormat（commit 前）切好；
             // 不再在 startRunning 后切换 activeFormat（多摄下会卡顿闪退）
 
@@ -476,7 +490,11 @@ final class CameraManager {
         // applyHDRFormatIfNeeded 放在 commit+startRunning 之后调用，
         // 即"杜比一开就闪退"的直接原因）。
         var format: AVCaptureDevice.Format?
-        if dolbyVisionEnabled {
+        // 判据与 hdrFormatAvailable（attach/refresh 共用）完全同源：
+        // 开关开 && 两路当前档位都有 10-bit 格式且设备支持 HDR，才切
+        // 10-bit；任一不满足则两路统一回退 8-bit，杜比开关由
+        // refreshDolbyCapability 关闭（避免"采集 10-bit、链路按 SDR"并存）。
+        if dolbyVisionEnabled && hdrFormatAvailable() {
             format = findHDRFormat(for: device, width: dims.width, height: dims.height)
         }
         if format == nil {
@@ -499,7 +517,22 @@ final class CameraManager {
         let duration = CMTime(value: 1, timescale: CMTimeScale(preset.fps))
         device.activeVideoMinFrameDuration = duration
         device.activeVideoMaxFrameDuration = duration
+        // 杜比：显式使能硬件 HDR 采集（仅 10-bit 格式下有意义；多摄下
+        // 防止系统自动降回 SDR 采集）。与系统相机同源行为。
+        if dolbyVisionEnabled,
+           is10BitFormat(format),
+           device.isVideoHDRSupported {
+            device.setAutomaticallyAdjustsVideoHDREnabled(false)
+            device.videoHDREnabled = true
+        }
         device.unlockForConfiguration()
+    }
+
+    /// 是否为 10-bit HDR 像素格式（P010 VideoRange / FullRange）
+    private func is10BitFormat(_ format: AVCaptureDevice.Format) -> Bool {
+        let subtype = UInt32(CMFormatDescriptionGetMediaSubType(format.formatDescription))
+        return subtype == UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+            || subtype == UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
     }
 
     /// 麦克风输入 + 空间音频/立体声模式
@@ -545,6 +578,27 @@ final class CameraManager {
         constrainMovieOutput(outA, keep: cameraA)
         constrainMovieOutput(outB, keep: cameraB)
 
+        // 杜比：录像连接显式切 HLG/BT.2020 色域（与 applyFormat 切好的
+        // 10-bit 格式 + applyOutputCodec 的 dvhe 编码器配套，保证编码
+        // 颜色空间正确；漏掉会产出颜色标记缺失/偏色的 HDR 文件）。
+        // 条件与 refreshDolbyCapability 的最终可用性完全同源（格式 +
+        // dvhe 编码器支持）：能力不足时**不设色域**，避免"实际以 SDR
+        // 录制但连接带 HLG 颜色标记"的成片偏色。必须在 commit 前
+        // （本函数在 beginConfiguration 内）设置。
+        let useDolbyB = dolbyVisionEnabled
+            && hdrFormatAvailable()
+            && [outA, outB].allSatisfy {
+                $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec)
+            }
+        if useDolbyB {
+            for conn in outA.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
+                try? conn.setActiveColorSpace(.hlgBT2020)
+            }
+            for conn in outB.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
+                try? conn.setActiveColorSpace(.hlgBT2020)
+            }
+        }
+
         modeBRecorder.attach(outputA: outA, outputB: outB)
         // 录制完成/失败回调由 startRecording 按"收尾代际"统一设置
         // （attach 阶段不设：回调只在本轮录制触发，且需捕获当时的 token）
@@ -581,8 +635,25 @@ final class CameraManager {
         let outB = AVCaptureVideoDataOutput()
         let outAudio = AVCaptureAudioDataOutput()
 
+        // 杜比：请求 10-bit P010。判定与 refreshDolbyCapability 的最终
+        // 可用性完全同源（格式 + 数据输出 P010 支持），避免"attach 按旧
+        // 开关值请求 P010、refresh 因能力不足关闭开关"导致录制时
+        // 10-bit 采集/SDR 写入的格式错配。若任一路无 10-bit 格式或数据
+        // 输出不支持 P010，回退 BGRA（SDR 链路 32BGRA 一行不动），杜比
+        // 开关由 refreshDolbyCapability 统一关闭。
+        let useHDR = dolbyVisionEnabled
+            && hdrFormatAvailable()
+            && [outA, outB].allSatisfy {
+                $0.availableVideoPixelFormatTypes
+                    .contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+            }
+        // 记录会话实际生效的杜比状态（录制端以此决定写入分支）
+        compositeOutputIsHDR = useHDR
+        let pixelFormat: OSType = useHDR
+            ? kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            : kCVPixelFormatType_32BGRA
         for out in [outA, outB] {
-            out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA]
+            out.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: pixelFormat]
             out.alwaysDiscardsLateVideoFrames = true
         }
         outA.setSampleBufferDelegate(modeARecorder, queue: modeARecorder.videoQueueA)
@@ -599,6 +670,15 @@ final class CameraManager {
         // 每个数据输出同样会自动为两路视频建连：关闭不属于自己的那路
         compositeVideoConnA = constrainDataOutput(outA, keep: cameraA)
         compositeVideoConnB = constrainDataOutput(outB, keep: cameraB)
+
+        // 杜比：数据输出连接显式切 HLG/BT.2020 色域（与 10-bit 格式配套，
+        // 采集到带 HDR 颜色信息的 P010）。必须在 commit 前（attach 在
+        // beginConfiguration 内）设置；不支持时静默（try?），由
+        // refreshDolbyCapability 的格式探测兜底关闭。
+        if useHDR {
+            if let conn = compositeVideoConnA { try? conn.setActiveColorSpace(.hlgBT2020) }
+            if let conn = compositeVideoConnB { try? conn.setActiveColorSpace(.hlgBT2020) }
+        }
 
         modeARecorder.attach(videoOutputA: outA, videoOutputB: outB,
                              audioOutput: outAudio,
@@ -709,40 +789,66 @@ final class CameraManager {
     /// -----------------------------------------------------------------------
     /// 判据（全部满足才可用）：
     ///  1. 当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 采集格式；
-    ///  2. MovieFileOutput 可用编码器列表确实含 dvhe。
-    /// 双条件与 applyFormat（切 10-bit）、applyOutputCodec（设 dvhe）行为完全一致，
-    /// 避免"判据说支持、实际切不了/设不了"的错配——错配会让 setOutputSettings(dvhe)
-    /// 在 8-bit 连接上抛 NSException（真机崩溃报告实锤）。
-    /// setOutputSettings 必须在会话配置阶段（commit 前）调用，运行中调用会闪退。
+    /// 当前档位两路是否都有 10-bit HDR 采集格式（杜比判定核心条件；
+    /// 与 applyFormat 实际切到的格式 + videoHDREnabled 守卫完全同源）
+    private func hdrFormatAvailable() -> Bool {
+        guard let camA = cameraA, let camB = cameraB else { return false }
+        let dims = preset.landscapeDimensions
+        return [camA.device, camB.device].allSatisfy {
+            $0.isVideoHDRSupported
+                && findHDRFormat(for: $0, width: dims.width, height: dims.height) != nil
+        }
+    }
+
+    /// 刷新杜比可用性（UI 置灰依据 + 自动关闭闭环），并在会话配置阶段
+    /// 应用对应输出编码器。
+    /// 判据：
+    ///  1. 当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 采集格式；
+    ///  2. 按模式区分写入能力——
+    ///     双文件：MovieFileOutput 可用编码器列表确实含 dvhe；
+    ///     合成：AVAssetWriter 走 HEVC Main10 + HDR 属性（无 dvhe 编码器
+    ///     概念），只需数据输出支持 P010 像素格式。
+    /// 双条件与 applyFormat（切 10-bit）、attachCompositeOutputs（请求 P010）、
+    /// applyOutputCodec（设 dvhe）行为完全一致，避免"判据说支持、实际切不了/
+    /// 设不了"的错配——错配会让 setOutputSettings(dvhe) 在 8-bit 连接上抛
+    /// NSException（真机崩溃报告实锤）。
+    /// setOutputSettings / setActiveColorSpace 必须在会话配置阶段（commit 前）
+    /// 调用，运行中调用会闪退。
     private func refreshDolbyCapability() {
-        guard mode == .dualFiles, let camA = cameraA, let camB = cameraB else {
+        guard cameraA != nil, cameraB != nil else {
             let wasAvailable = isDolbyVisionAvailable
             isDolbyVisionAvailable = false
             if dolbyVisionEnabled {
                 dolbyVisionEnabled = false
+                persistSettings()   // 自动关闭落盘：下次启动不再恢复开启→再关→重复弹窗
                 if wasAvailable { showDegradationBanner("杜比视界当前不可用，已自动关闭") }
             }
             applyOutputCodec(useDolby: false)
             return
         }
-        // 判据收紧：当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 格式，
-        // **且** MovieFileOutput 可用编码器列表确实含 dvhe。
-        // 之前只查"设备存在任一 10-bit 格式"，会与实际 applyFormat 切到的
-        // 格式脱节：档位无 10-bit 时 applyFormat 静默回退 8-bit，这里却仍判
-        // "支持"，随后 setOutputSettings(dvhe) 在 8-bit 连接上抛 NSException
-        // → SIGABRT（真机崩溃报告实锤，见 applyOutputCodec 注释）。
-        let dims = preset.landscapeDimensions
-        let formatOK = [camA.device, camB.device].allSatisfy {
-            findHDRFormat(for: $0, width: dims.width, height: dims.height) != nil
+        let formatOK = hdrFormatAvailable()
+        var codecOK = true
+        switch mode {
+        case .dualFiles:
+            codecOK = [movieOutputA, movieOutputB]
+                .compactMap { $0 }
+                .allSatisfy { $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec) }
+        case .composite:
+            // 合成写入不经过 MovieFileOutput：可用性只取决于采集侧 10-bit
+            // 格式（已由 formatOK 保证）与数据输出对 P010 的支持。
+            codecOK = [videoDataOutputA, videoDataOutputB]
+                .compactMap { $0 }
+                .allSatisfy {
+                    $0.availableVideoPixelFormatTypes
+                        .contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+                }
         }
-        let codecOK = [movieOutputA, movieOutputB]
-            .compactMap { $0 }
-            .allSatisfy { $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec) }
 
         let available = formatOK && codecOK
         isDolbyVisionAvailable = available
         if dolbyVisionEnabled && !available {
             dolbyVisionEnabled = false
+            persistSettings()   // 自动关闭落盘：下次启动不再恢复开启→再关→重复弹窗
             showDegradationBanner("当前档位不支持杜比视界，已自动关闭")
         }
         applyOutputCodec(useDolby: dolbyVisionEnabled && available)
@@ -816,47 +922,123 @@ final class CameraManager {
                               + "已自动降级到 \(fallback.displayName) \(fallback.frameRateText)")
     }
 
+    // MARK: - 设置持久化
+
+    /// 设置存储键（UserDefaults）
+    private enum SettingsKey {
+        static let preset = "settings.preset"
+        static let layout = "settings.layout"
+        static let mode = "settings.mode"
+        static let dolbyVision = "settings.dolbyVision"
+        static let spatialAudio = "settings.spatialAudio"
+        static let stabilization = "settings.stabilization"
+        static let focusLock = "settings.focusLock"
+        static let exposureLock = "settings.exposureLock"
+        static let exposureBias = "settings.exposureBias"
+        static let includeLocation = "settings.includeLocation"
+        static let cameraA = "settings.cameraA"
+        static let cameraB = "settings.cameraB"
+    }
+
+    /// 把全部用户可调设置写入 UserDefaults（第二次打开保留上次状态）
+    private func persistSettings() {
+        let d = UserDefaults.standard
+        d.set(preset.rawValue, forKey: SettingsKey.preset)
+        d.set(layout.rawValue, forKey: SettingsKey.layout)
+        d.set(mode.rawValue, forKey: SettingsKey.mode)
+        d.set(dolbyVisionEnabled, forKey: SettingsKey.dolbyVision)
+        d.set(spatialAudioEnabled, forKey: SettingsKey.spatialAudio)
+        d.set(stabilizationEnabled, forKey: SettingsKey.stabilization)
+        d.set(focusLockState, forKey: SettingsKey.focusLock)
+        d.set(exposureLockState, forKey: SettingsKey.exposureLock)
+        d.set(exposureBias, forKey: SettingsKey.exposureBias)
+        d.set(includeLocation, forKey: SettingsKey.includeLocation)
+        d.set(cameraA?.id, forKey: SettingsKey.cameraA)
+        d.set(cameraB?.id, forKey: SettingsKey.cameraB)
+    }
+
+    /// 启动恢复：必须在 discoverCameras() 之后调用（镜头恢复依赖可用列表）
+    private func restoreSettings() {
+        let d = UserDefaults.standard
+        if let raw = d.string(forKey: SettingsKey.preset),
+           let v = ResolutionPreset(rawValue: raw) { preset = v }
+        if let raw = d.string(forKey: SettingsKey.layout),
+           let v = PreviewLayout(rawValue: raw) { layout = v }
+        if let raw = d.string(forKey: SettingsKey.mode),
+           let v = RecordingMode(rawValue: raw) { mode = v }
+        // 杜比默认关；已开启过则恢复开启（探测不支持时 refreshDolbyCapability
+        // 会自动关闭并提示）
+        dolbyVisionEnabled = d.bool(forKey: SettingsKey.dolbyVision)
+        // 空间音频默认开：未设置过时保持默认 true（bool(forKey:) 对未设置
+        // 返回 false，会错误关闭，故用 object 判存在性）
+        spatialAudioEnabled = d.object(forKey: SettingsKey.spatialAudio) as? Bool ?? true
+        if let v = d.array(forKey: SettingsKey.stabilization) as? [NSNumber], v.count == 2 {
+            stabilizationEnabled = v.map(\.boolValue)
+        }
+        if let v = d.array(forKey: SettingsKey.focusLock) as? [NSNumber], v.count == 2 {
+            focusLockState = v.map(\.boolValue)
+        }
+        if let v = d.array(forKey: SettingsKey.exposureLock) as? [NSNumber], v.count == 2 {
+            exposureLockState = v.map(\.boolValue)
+        }
+        if let v = d.array(forKey: SettingsKey.exposureBias) as? [NSNumber], v.count == 2 {
+            exposureBias = v.map(\.floatValue)
+        }
+        if d.object(forKey: SettingsKey.includeLocation) != nil { includeLocation = d.bool(forKey: SettingsKey.includeLocation) }
+        if let id = d.string(forKey: SettingsKey.cameraA),
+           let opt = availableCameras.first(where: { $0.id == id }) { cameraA = opt }
+        if let id = d.string(forKey: SettingsKey.cameraB),
+           let opt = availableCameras.first(where: { $0.id == id }) { cameraB = opt }
+    }
+
     // MARK: - 对外设置方法（全部在非录制状态下生效）
 
     func setPreset(_ newValue: ResolutionPreset) {
         guard !isRecording, !isFinalizing, preset != newValue else { return }
         preset = newValue
         applyConfiguration()
+        persistSettings()
     }
 
     func setLayout(_ newValue: PreviewLayout) {
         guard !isRecording, !isFinalizing, layout != newValue else { return }
         layout = newValue
+        persistSettings()
     }
 
     func setMode(_ newValue: RecordingMode) {
         guard !isRecording, !isFinalizing, mode != newValue else { return }
         mode = newValue
         applyConfiguration()
+        persistSettings()
     }
 
     func setDolbyVision(_ enabled: Bool) {
         guard !isRecording, !isFinalizing, dolbyVisionEnabled != enabled else { return }
         dolbyVisionEnabled = enabled
         applyConfiguration()
+        persistSettings()
     }
 
     func setSpatialAudio(_ enabled: Bool) {
         guard !isRecording, !isFinalizing, spatialAudioEnabled != enabled else { return }
         spatialAudioEnabled = enabled
         applyConfiguration()
+        persistSettings()
     }
 
     func setStabilization(_ enabled: Bool, slot: CameraSlot) {
         guard !isRecording, !isFinalizing, stabilizationEnabled[slot.index] != enabled else { return }
         stabilizationEnabled[slot.index] = enabled
         applyStabilization()
+        persistSettings()
     }
 
     /// 拍摄地点开关（打开时若未授权则立即请求一次定位权限）
     func setIncludeLocation(_ on: Bool) {
         includeLocation = on
         if on { requestLocationIfNeeded() }
+        persistSettings()
     }
 
     /// 更换某路镜头（先做组合校验，不支持的组合直接拒绝并提示）
@@ -878,6 +1060,7 @@ final class CameraManager {
         exposureLockState = [false, false]
         exposureBias = [0, 0]
         applyConfiguration()
+        persistSettings()
     }
 
     // MARK: - 曝光（每路独立）
@@ -905,6 +1088,8 @@ final class CameraManager {
         device.setExposureTargetBias(clamped, completionHandler: nil)
         device.unlockForConfiguration()
         exposureBias[slot.index] = clamped
+        // 曝光补偿滑块拖动高频触发，只写本键避免每次全量写盘
+        UserDefaults.standard.set(exposureBias, forKey: SettingsKey.exposureBias)
     }
 
     /// 该路曝光补偿可调范围（守卫：无效范围一律回退默认，避免 Slider 构造崩溃）
@@ -927,6 +1112,7 @@ final class CameraManager {
         guard !isRecording, !isFinalizing, focusLockState[slot.index] != locked else { return }
         focusLockState[slot.index] = locked
         applyLock(slot: slot)
+        persistSettings()
     }
 
     /// 设置面板用：锁定/解锁该路曝光（不影响对焦）
@@ -934,6 +1120,7 @@ final class CameraManager {
         guard !isRecording, !isFinalizing, exposureLockState[slot.index] != locked else { return }
         exposureLockState[slot.index] = locked
         applyLock(slot: slot)
+        persistSettings()
     }
 
     private func applyLock(slot: CameraSlot) {
@@ -953,6 +1140,21 @@ final class CameraManager {
             if device.isExposureModeSupported(.continuousAutoExposure) { device.exposureMode = .continuousAutoExposure }
         }
         device.unlockForConfiguration()
+    }
+
+    /// 把当前的对焦锁/曝光锁/曝光补偿状态应用到设备（保证 UI 与设备一致）。
+    /// 调用点：①启动恢复后首次 applyConfiguration；②换镜头复位后。
+    /// 必须在会话已配置（startRunning 后）调用；applyLock/setExposureBias
+    /// 内部自带设备 lock/unlock 与支持性守卫，安全静默。
+    private func restoreDeviceCaptureStates() {
+        for slot in CameraSlot.allCases {
+            if focusLockState[slot.index] || exposureLockState[slot.index] {
+                applyLock(slot: slot)
+            }
+            if exposureBias[slot.index] != 0 {
+                setExposureBias(exposureBias[slot.index], slot: slot)
+            }
+        }
     }
 
     // MARK: - 录制
@@ -1017,7 +1219,8 @@ final class CameraManager {
                                         layout: layout,
                                         audioFormat: microphoneAudioFormat(),
                                         pipPosition: pipPosition,
-                                        pipCornerRadiusRatio: pipCornerRadiusRatio)
+                                        pipCornerRadiusRatio: pipCornerRadiusRatio,
+                                        hdr: compositeOutputIsHDR)
                 modeARecorder.onFinished = { [weak self] urls in
                     self?.handleRecordingFinished(urls: urls, token: token)
                 }

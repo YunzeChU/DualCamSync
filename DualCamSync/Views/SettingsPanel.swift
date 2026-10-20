@@ -35,23 +35,22 @@ struct SettingsPanel: View {
                     }
                 }
 
-                // 杜比视界 HDR
+                // 杜比视界 HDR（模式A 合成、模式B 双文件均支持）
                 Toggle("杜比视界 HDR (Dolby Vision)", isOn: Binding(
                     get: { camera.dolbyVisionEnabled },
                     set: { camera.setDolbyVision($0) }
                 ))
                 .tint(.yellow)
                 .disabled(!camera.isDolbyVisionAvailable
-                          || camera.mode == .composite
                           || camera.isRecording
                           || camera.isFinalizing)
-                .opacity((camera.isDolbyVisionAvailable && camera.mode == .dualFiles) ? 1 : 0.35)
-                if camera.mode == .composite {
-                    hint("仅双文件模式支持杜比视界 HDR；合成模式为保证兼容使用普通 HEVC")
-                } else if !camera.isDolbyVisionAvailable {
-                    hint("当前设备/镜头组合不支持杜比视界 HDR，已自动置灰")
+                .opacity(camera.isDolbyVisionAvailable ? 1 : 0.35)
+                if !camera.isDolbyVisionAvailable {
+                    hint("当前设备/镜头组合/档位不支持杜比视界 HDR，已自动置灰")
                 } else if camera.dolbyVisionEnabled {
-                    hint("正在以 Dolby Vision 录制：采集、预览、成片全链路 HDR")
+                    hint("正在以 Dolby Vision 录制：10-bit HDR 采集、合成、成片全链路")
+                } else {
+                    hint("开启后以杜比视界（10-bit HDR）录制；当前档位不支持时自动关闭并提示")
                 }
 
                 // 空间音频

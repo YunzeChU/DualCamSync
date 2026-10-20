@@ -2,6 +2,7 @@ import AVFoundation
 import CoreMedia
 import Foundation
 import QuartzCore   // CACurrentMediaTime() 显式依赖（避免 SDK 间接导入差异）
+import VideoToolbox // 杜比视界 HDR 压缩属性（HDRMetadataInsertionMode 等）
 
 /// 模式A：合成单条录制器
 /// -------------------------------------------------------------
@@ -129,11 +130,15 @@ final class ModeARecorder: NSObject,
     ///     模式A合成时 makePiP 按此摆放 B 路小窗。
     ///   - pipCornerRadiusRatio: 成片小窗圆角半径比例（= 预览小窗圆角
     ///     18pt / 预览小窗宽），保证成片小窗与预览一样是圆角矩形。
+    ///   - hdr: 是否杜比视界录制（true 时采集为 10-bit P010、写入
+    ///     HEVC Main10 + HLG/BT.2020 + 自动注入杜比元数据；false 为
+    ///     现有 SDR 链路 BT.709）。
     func start(outputSize: (width: Int32, height: Int32),
                layout: PreviewLayout,
                audioFormat: (sampleRate: Double, channels: Int)?,
                pipPosition: CGPoint,
-               pipCornerRadiusRatio: CGFloat) throws {
+               pipCornerRadiusRatio: CGFloat,
+               hdr: Bool) throws {
         guard !isRecording else {
             // 静默返回 = 录制键点了毫无反应；必须抛错让上层弹窗说明
             throw CameraError.recordingFailed("上一段视频仍在收尾，请稍候")
@@ -148,33 +153,60 @@ final class ModeARecorder: NSObject,
 
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
-        // 视频输入：HEVC 硬件编码
+        // 视频输入：HEVC 硬件编码（SDR = BT.709；杜比 = Main10 + HLG/BT.2020）
         let bitrate = estimateVideoBitrate(width: outputSize.width, height: outputSize.height)
-        let videoSettings: [String: Any] = [
-            AVVideoCodecKey: AVVideoCodecType.hevc,
-            AVVideoWidthKey: outputSize.width,
-            AVVideoHeightKey: outputSize.height,
-            // 显式声明输入像素颜色属性（BT.709）：合成器输出的是全范围
-            // BGRA 像素（渲染 colorSpace = sRGB，原色与 BT.709 相同）。
-            // 若不声明，编码器可能按错误矩阵/范围转换（默认 BT.601 +
-            // limited），导致成片偏蓝偏暗、与预览不一致——真机实测
-            // "封面正常、播放偏色"即颜色标记缺失的表现。
-            AVVideoColorPropertiesKey: [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
-            ],
-            AVVideoCompressionPropertiesKey: [
+        let videoSettings: [String: Any]
+        let adaptorPixelFormat: OSType
+        if hdr {
+            // 杜比视界：HEVC Main10 + BT.2020 色原/矩阵 + HLG 传递函数 +
+            // 编码器自动注入杜比元数据（VideoToolbox HDRMetadataInsertionMode=Auto，
+            // 与系统相机同源）。输入像素为 10-bit P010（采集端已切 10-bit 格式）。
+            let compression: [String: Any] = [
                 AVVideoAverageBitRateKey: bitrate,
-                // 不显式指定 profile：交由系统按分辨率/帧率自动选择（HEVC Main/Main10）
-            ],
-        ]
+                AVVideoProfileLevelKey: AVVideoProfileLevelH10AutoLevel,
+                kVTCompressionPropertyKey_HDRMetadataInsertionMode as String: kVTHDRMetadataInsertionMode_Auto,
+                kVTCompressionPropertyKey_PreserveDynamicHDRMetadata as String: true,
+            ]
+            videoSettings = [
+                AVVideoCodecKey: AVVideoCodecType.hevc,
+                AVVideoWidthKey: outputSize.width,
+                AVVideoHeightKey: outputSize.height,
+                AVVideoColorPropertiesKey: [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_2020,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_2100_HLG,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_2020,
+                ],
+                AVVideoCompressionPropertiesKey: compression,
+            ]
+            adaptorPixelFormat = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        } else {
+            videoSettings = [
+                AVVideoCodecKey: AVVideoCodecType.hevc,
+                AVVideoWidthKey: outputSize.width,
+                AVVideoHeightKey: outputSize.height,
+                // 显式声明输入像素颜色属性（BT.709）：合成器输出的是全范围
+                // BGRA 像素（渲染 colorSpace = sRGB，原色与 BT.709 相同）。
+                // 若不声明，编码器可能按错误矩阵/范围转换（默认 BT.601 +
+                // limited），导致成片偏蓝偏暗、与预览不一致——真机实测
+                // "封面正常、播放偏色"即颜色标记缺失的表现。
+                AVVideoColorPropertiesKey: [
+                    AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                    AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                    AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+                ],
+                AVVideoCompressionPropertiesKey: [
+                    AVVideoAverageBitRateKey: bitrate,
+                    // 不显式指定 profile：交由系统按分辨率/帧率自动选择（HEVC Main/Main10）
+                ],
+            ]
+            adaptorPixelFormat = kCVPixelFormatType_32BGRA
+        }
         let videoInput = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
         videoInput.expectsMediaDataInRealTime = true
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(
             assetWriterInput: videoInput,
             sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferPixelFormatTypeKey as String: adaptorPixelFormat,
                 kCVPixelBufferWidthKey as String: outputSize.width,
                 kCVPixelBufferHeightKey as String: outputSize.height,
             ]
