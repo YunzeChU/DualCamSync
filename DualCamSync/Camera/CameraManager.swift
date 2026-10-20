@@ -524,7 +524,7 @@ final class CameraManager {
         // （AVCaptureDevice 无 isVideoHDRSupported API）。多摄下防止系统
         // 自动降回 SDR 采集，与系统相机同源行为。
         if dolbyVisionEnabled, is10BitFormat(format) {
-            device.activeColorSpace = .hlgBT2020
+            device.activeColorSpace = .HLG_BT2020
             device.isVideoHDREnabled = true
         }
         device.unlockForConfiguration()

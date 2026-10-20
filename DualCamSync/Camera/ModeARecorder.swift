@@ -163,7 +163,9 @@ final class ModeARecorder: NSObject,
             // 与系统相机同源）。输入像素为 10-bit P010（采集端已切 10-bit 格式）。
             let compression: [String: Any] = [
                 AVVideoAverageBitRateKey: bitrate,
-                AVVideoProfileLevelKey: AVVideoProfileLevelHEVCMain10AutoLevel,
+                // HEVC profile/level 常量定义在 VideoToolbox/VTCompressionProperties.h
+                // （AVFoundation 头文件注释原文），AVVideoProfileLevelKey 直接接受该值
+                AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel,
                 kVTCompressionPropertyKey_HDRMetadataInsertionMode as String: kVTHDRMetadataInsertionMode_Auto,
                 kVTCompressionPropertyKey_PreserveDynamicHDRMetadata as String: true,
             ]
