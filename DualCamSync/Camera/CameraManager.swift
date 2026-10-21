@@ -76,6 +76,12 @@ final class CameraManager {
     /// 各档位在"当前双摄组合"下的可用性（UI 置灰用）
     var presetAvailability: [ResolutionPreset: Bool] = [:]
     var isDolbyVisionAvailable = false
+    /// 杜比能力诊断摘要（真机验证用，验证后可删）：两路 formats 统计
+    var hdrFormatDiagnostics = ""
+    /// 运行时实测：HDR 会话下首帧输出是否 10-bit（模式A 首帧校验后为 true；
+    /// 模式B MovieFileOutput 无帧回调，保持 false 表示未校验）
+    var hdrPipelineVerified = false
+    var hdrPipelineOK = true
     var isSpatialAudioAvailable = false
     var isMultiCamSupported = true
 
@@ -316,6 +322,11 @@ final class CameraManager {
 
         session.beginConfiguration()
         teardownSession()
+        // 重置杜比诊断状态：模式/档位/镜头切换后不残留上次会话旧值
+        // （模式B 无帧校验、compositeOutputIsHDR 仅模式A 有效；外部审核 P1-4）
+        hdrPipelineVerified = false
+        hdrPipelineOK = true
+        compositeOutputIsHDR = false
         do {
             let inputA = try AVCaptureDeviceInput(device: camA.device)
             let inputB = try AVCaptureDeviceInput(device: camB.device)
@@ -324,6 +335,19 @@ final class CameraManager {
             }
             session.addInput(inputA)
             session.addInput(inputB)
+
+            // 录制输出（按模式）先挂：applyFormat 判定杜比可用性需要输出
+            // 实例的编码器/像素格式能力（MovieFileOutput.availableVideoCodecTypes
+            // / VideoDataOutput.availableVideoPixelFormatTypes），必须建好输出
+            // 再切格式，保证 applyFormat 与 refreshDolbyCapability 判据同源
+            // （外部审核 P1-1/P2-8：原顺序 applyFormat 先切 10-bit、refresh
+            // 后判定 codec 不可用才关开关，导致"开关已关、采集仍 10-bit"错配）。
+            switch mode {
+            case .dualFiles:
+                try attachDualFileOutputs(videoInputA: inputA, videoInputB: inputB)
+            case .composite:
+                attachCompositeOutputs(videoInputA: inputA, videoInputB: inputB)
+            }
 
             // 多摄会话中每台设备可独立配置 activeFormat
             try applyFormat(device: camA.device, preset: preset)
@@ -342,14 +366,6 @@ final class CameraManager {
 
             // 音频输入（立体声 / 空间音频）
             try attachAudioInput()
-
-            // 录制输出（按模式）
-            switch mode {
-            case .dualFiles:
-                try attachDualFileOutputs(videoInputA: inputA, videoInputB: inputB)
-            case .composite:
-                attachCompositeOutputs(videoInputA: inputA, videoInputB: inputB)
-            }
 
             // 防抖 / 方向 / 杜比（输出编码器必须在 commit 前设置）
             applyStabilization()
@@ -491,11 +507,13 @@ final class CameraManager {
         // 即"杜比一开就闪退"的直接原因）。
         var format: AVCaptureDevice.Format?
         // 判据与 hdrFormatAvailable（attach/refresh 共用）完全同源：
-        // 开关开 && 两路当前档位都有 10-bit 格式且设备支持 HDR，才切
-        // 10-bit；任一不满足则两路统一回退 8-bit，杜比开关由
+        // 开关开 && 杜比全链路可用（格式 + 当前模式 dvhe/P010 写入能力），
+        // 才切 HDR 格式；任一不满足则两路统一回退 8-bit，杜比开关由
         // refreshDolbyCapability 关闭（避免"采集 10-bit、链路按 SDR"并存）。
-        if dolbyVisionEnabled && hdrFormatAvailable() {
+        var isHDRFormat = false
+        if dolbyVisionEnabled && dolbyCapabilityAvailable() {
             format = findHDRFormat(for: device, width: dims.width, height: dims.height)
+            isHDRFormat = format != nil
         }
         if format == nil {
             format = device.formats.first(where: { f in
@@ -520,21 +538,22 @@ final class CameraManager {
         // 杜比：显式使能硬件 HDR 采集并切 HLG/BT.2020 色域。色域是设备级
         // 属性（AVCaptureDevice.activeColorSpace，AVCaptureConnection 无
         // setActiveColorSpace），必须与 activeFormat 一起在 lock 内设置、
-        // commit 前完成。10-bit 格式存在即 HDR 能力，无需额外支持性查询
-        // （AVCaptureDevice 无 isVideoHDRSupported API）。多摄下防止系统
-        // 自动降回 SDR 采集，与系统相机同源行为。
-        if dolbyVisionEnabled, is10BitFormat(format) {
+        // commit 前完成。isHDRFormat 与 findHDRFormat 完全同源：HDR 格式
+        // 在多摄兼容子集内由系统保证可持续运行，且 activeColorSpace =
+        // .HLG_BT2020 时 HDR 强制开启（Apple 文档），与系统相机同源行为。
+        if dolbyVisionEnabled, isHDRFormat {
             device.activeColorSpace = .HLG_BT2020
             device.isVideoHDREnabled = true
+        } else {
+            // 显式复位 SDR（不依赖系统切换 activeFormat 时的隐式回退——
+            // 行为未保证）：开过杜比再关（含自动关闭）后，8-bit 格式上
+            // 不允许残留 HLG 色域/HDR 开关，否则 SDR 录制会按 HLG 解释
+            // 8-bit 像素导致偏色发暗（外部审核 P1-2，唯一 SDR 回归点）。
+            // .sRGB 为所有格式支持的基础色域，lock 内设置安全。
+            device.activeColorSpace = .sRGB
+            device.isVideoHDREnabled = false
         }
         device.unlockForConfiguration()
-    }
-
-    /// 是否为 10-bit HDR 像素格式（P010 VideoRange / FullRange）
-    private func is10BitFormat(_ format: AVCaptureDevice.Format) -> Bool {
-        let subtype = UInt32(CMFormatDescriptionGetMediaSubType(format.formatDescription))
-        return subtype == UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
-            || subtype == UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
     }
 
     /// 麦克风输入 + 空间音频/立体声模式
@@ -619,18 +638,21 @@ final class CameraManager {
         let outB = AVCaptureVideoDataOutput()
         let outAudio = AVCaptureAudioDataOutput()
 
-        // 杜比：请求 10-bit P010。判定与 refreshDolbyCapability 的最终
-        // 可用性完全同源（格式 + 数据输出 P010 支持），避免"attach 按旧
-        // 开关值请求 P010、refresh 因能力不足关闭开关"导致录制时
-        // 10-bit 采集/SDR 写入的格式错配。若任一路无 10-bit 格式或数据
-        // 输出不支持 P010，回退 BGRA（SDR 链路 32BGRA 一行不动），杜比
-        // 开关由 refreshDolbyCapability 统一关闭。
-        let useHDR = dolbyVisionEnabled
-            && hdrFormatAvailable()
-            && [outA, outB].allSatisfy {
-                $0.availableVideoPixelFormatTypes
-                    .contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
-            }
+        // 输出实例先落属性：dolbyCapabilityAvailable() 判定需要
+        // availableVideoPixelFormatTypes（实例初始化即有，无需入会话；
+        // 外部审核 P2-8——原实现此处用局部 outA/outB，与 applyFormat
+        // 判据不同源）。
+        videoDataOutputA = outA
+        videoDataOutputB = outB
+        audioDataOutput = outAudio
+
+        // 杜比：请求 10-bit P010。判定与 applyFormat / refreshDolbyCapability
+        // 完全同源（单一来源 dolbyCapabilityAvailable：格式 + P010 写入
+        // 能力），避免"attach 按旧开关值请求 P010、refresh 因能力不足关闭
+        // 开关"导致录制时 10-bit 采集/SDR 写入的格式错配。任一路不满足
+        // 回退 BGRA（SDR 链路 32BGRA 一行不动），杜比开关由
+        // refreshDolbyCapability 统一关闭。
+        let useHDR = dolbyVisionEnabled && dolbyCapabilityAvailable()
         // 记录会话实际生效的杜比状态（录制端以此决定写入分支）
         compositeOutputIsHDR = useHDR
         let pixelFormat: OSType = useHDR
@@ -647,9 +669,6 @@ final class CameraManager {
         session.addOutput(outA)
         session.addOutput(outB)
         session.addOutput(outAudio)
-        videoDataOutputA = outA
-        videoDataOutputB = outB
-        audioDataOutput = outAudio
 
         // 每个数据输出同样会自动为两路视频建连：关闭不属于自己的那路
         compositeVideoConnA = constrainDataOutput(outA, keep: cameraA)
@@ -658,6 +677,20 @@ final class CameraManager {
         modeARecorder.attach(videoOutputA: outA, videoOutputB: outB,
                              audioOutput: outAudio,
                              connA: compositeVideoConnA, connB: compositeVideoConnB)
+        // 运行时校验（模式A 才有帧回调）：HDR 会话下首帧实测输出像素格式，
+        // 验证"请求 P010 是否真生效"。模式B MovieFileOutput 无帧回调，
+        // 由系统编码器内部保证，不做此校验。
+        modeARecorder.onHDRPipelineVerified = { [weak self] isP010 in
+            guard let self else { return }
+            let expectedHDR = self.compositeOutputIsHDR
+            // HDR 会话必须输出 10-bit；SDR 会话意外输出 10-bit 也是链路错配信号
+            let ok = expectedHDR ? isP010 : !isP010
+            self.hdrPipelineVerified = true
+            self.hdrPipelineOK = ok
+            if expectedHDR && !isP010 {
+                self.degradationBanner = "杜比采集未生效：输出非 10-bit，本段实际按 SDR 写入"
+            }
+        }
         // 录制完成/失败回调由 startRecording 按"收尾代际"统一设置
     }
 
@@ -764,14 +797,40 @@ final class CameraManager {
     /// -----------------------------------------------------------------------
     /// 判据（全部满足才可用）：
     ///  1. 当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 采集格式；
-    /// 当前档位两路是否都有 10-bit HDR 采集格式（杜比判定核心条件；
-    /// 与 applyFormat 实际切到的格式完全同源。10-bit 格式存在即设备
-    /// HDR 能力——AVCaptureDevice 无独立 isVideoHDRSupported API）
+    /// 当前档位两路是否都有 HDR 采集格式（杜比判定核心条件；与
+    /// applyFormat 实际切到的格式完全同源。HDR 格式判定使用官方能力标志
+    /// isVideoHDRSupported + isMultiCamSupported + HLG/BT.2020 色域）
     private func hdrFormatAvailable() -> Bool {
         guard let camA = cameraA, let camB = cameraB else { return false }
         let dims = preset.landscapeDimensions
         return [camA.device, camB.device].allSatisfy {
             findHDRFormat(for: $0, width: dims.width, height: dims.height) != nil
+        }
+    }
+
+    /// 杜比全链路可用性（**单一判定来源**：applyFormat / attachCompositeOutputs
+    /// / refreshDolbyCapability 共用，避免任一环节"判据说可用、实际切不了/设
+    /// 不了"的错配——外部审核 P1-1/P2-8）：
+    ///  1. 当前档位两路都有 HDR 采集格式（hdrFormatAvailable）；
+    ///  2. 当前模式的写入能力：
+    ///     双文件：MovieFileOutput 可用编码器确实含 dvhe；
+    ///     合成：VideoDataOutput 支持 P010 像素格式。
+    /// 注意：调用方必须先完成输出挂载（attach 后、输出属性已赋值），否则
+    /// 输出为 nil 时 allSatisfy 空数组恒 true（安全方向但不完整）。
+    private func dolbyCapabilityAvailable() -> Bool {
+        guard hdrFormatAvailable() else { return false }
+        switch mode {
+        case .dualFiles:
+            return [movieOutputA, movieOutputB]
+                .compactMap { $0 }
+                .allSatisfy { $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec) }
+        case .composite:
+            return [videoDataOutputA, videoDataOutputB]
+                .compactMap { $0 }
+                .allSatisfy {
+                    $0.availableVideoPixelFormatTypes
+                        .contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+                }
         }
     }
 
@@ -802,26 +861,11 @@ final class CameraManager {
             applyOutputCodec(useDolby: false)
             return
         }
-        let formatOK = hdrFormatAvailable()
-        var codecOK = true
-        switch mode {
-        case .dualFiles:
-            codecOK = [movieOutputA, movieOutputB]
-                .compactMap { $0 }
-                .allSatisfy { $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec) }
-        case .composite:
-            // 合成写入不经过 MovieFileOutput：可用性只取决于采集侧 10-bit
-            // 格式（已由 formatOK 保证）与数据输出对 P010 的支持。
-            codecOK = [videoDataOutputA, videoDataOutputB]
-                .compactMap { $0 }
-                .allSatisfy {
-                    $0.availableVideoPixelFormatTypes
-                        .contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
-                }
-        }
-
-        let available = formatOK && codecOK
+        // 全链路可用性：格式 + 当前模式写入能力（dvhe/P010），与
+        // applyFormat / attachCompositeOutputs 完全同源（外部审核 P1-1）
+        let available = dolbyCapabilityAvailable()
         isDolbyVisionAvailable = available
+        hdrFormatDiagnostics = buildHDRDiagnostics()
         if dolbyVisionEnabled && !available {
             dolbyVisionEnabled = false
             persistSettings()   // 自动关闭落盘：下次启动不再恢复开启→再关→重复弹窗
@@ -850,22 +894,73 @@ final class CameraManager {
     }
 
     /// 查找与当前宽高匹配、且支持目标帧率的 10-bit HDR 格式
+    /// 在当前档位（尺寸+帧率）下查找设备的 HDR 采集格式
+    /// -------------------------------------------------------------
+    /// 判据全部使用系统官方能力标志（不再依赖 pixel format 猜测——9/25
+    /// "多摄下 10-bit 格式 0 次"即 pixel format 判据误判，导致杜比开关
+    /// 全置灰；CamFusion 同机双路+杜比可用证明格式存在）：
+    ///  1. isMultiCamSupported：多摄会话只允许该子集可持续运行（Apple
+    ///     文档：isMultiCamSupported=false 的格式在多摄下不可设置）；
+    ///  2. isVideoHDRSupported：格式支持 HDR 视频流（官方 HDR 能力标志）；
+    ///  3. supportedColorSpaces 含 .HLG_BT2020：支持 HLG/BT.2020 色域
+    ///     （activeColorSpace = .HLG_BT2020 时 HDR 强制开启，Apple 文档）。
     private func findHDRFormat(for device: AVCaptureDevice,
                                width: Int32, height: Int32) -> AVCaptureDevice.Format? {
         let targetFPS = Double(preset.fps)
-        let targetVideoRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
-        let targetFullRange = UInt32(kCVPixelFormatType_420YpCbCr10BiPlanarFullRange)
         for format in device.formats {
-            let desc = format.formatDescription
-            // HDR 视频 = 10-bit 双平面（VideoRange / FullRange）
-            let subtype = UInt32(CMFormatDescriptionGetMediaSubType(desc))
-            guard subtype == targetVideoRange || subtype == targetFullRange else { continue }
-            let dims = CMVideoFormatDescriptionGetDimensions(desc)
+            guard format.isMultiCamSupported else { continue }
+            guard format.isVideoHDRSupported else { continue }
+            guard format.supportedColorSpaces.contains(.HLG_BT2020) else { continue }
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
             guard dims.width == width, dims.height == height else { continue }
-            guard format.videoSupportedFrameRateRanges.contains(where: { $0.maxFrameRate >= targetFPS - 0.5 }) else { continue }
+            // 帧率区间包含（与 SDR fallback 的格式选择同谓词，外部审核 P2-7：
+            // 只查 maxFrameRate 会让 31-120 的区间被误判为支持 30fps）
+            guard format.videoSupportedFrameRateRanges.contains(where: {
+                $0.minFrameRate <= targetFPS && targetFPS <= $0.maxFrameRate
+            }) else { continue }
             return format
         }
         return nil
+    }
+
+    /// 两路 HDR 格式探测摘要（真机诊断用，验证后可删）：
+    /// "镜头名 共N/多摄N/HDR N/档位HDR N"——总数 / 多摄兼容 / 官方 HDR
+    /// 标志 / 当前档位（尺寸+帧率）可用的 HDR 格式数
+    private func buildHDRDiagnostics() -> String {
+        guard let camA = cameraA, let camB = cameraB else { return "镜头未就绪" }
+        let dims = preset.landscapeDimensions
+        func summary(_ device: AVCaptureDevice) -> String {
+            let all = device.formats.count
+            let multi = device.formats.filter { $0.isMultiCamSupported }.count
+            let hdr = device.formats.filter { $0.isVideoHDRSupported }.count
+            let matched = device.formats.filter { f in
+                guard f.isMultiCamSupported, f.isVideoHDRSupported,
+                      f.supportedColorSpaces.contains(.HLG_BT2020) else { return false }
+                let fd = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
+                return fd.width == dims.width && fd.height == dims.height
+                    && f.videoSupportedFrameRateRanges.contains {
+                        $0.minFrameRate <= Double(preset.fps) && Double(preset.fps) <= $0.maxFrameRate
+                    }
+            }.count
+            return "\(device.localizedName) 共\(all)/多摄\(multi)/HDR\(hdr)/档位HDR\(matched)"
+        }
+        // 当前模式写入能力（外部审核 P1-5：dvhe 是否在 availableVideoCodecTypes
+        // 中、P010 是否被数据输出支持，均需真机实测确认）
+        let codecDiag: String
+        switch mode {
+        case .dualFiles:
+            let dvheOK = [movieOutputA, movieOutputB].compactMap { $0 }.allSatisfy {
+                $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec)
+            }
+            codecDiag = "模式B-dvhe:\(dvheOK ? "是" : "否")"
+        case .composite:
+            let p010OK = [videoDataOutputA, videoDataOutputB].compactMap { $0 }.allSatisfy {
+                $0.availableVideoPixelFormatTypes
+                    .contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
+            }
+            codecDiag = "模式A-P010:\(p010OK ? "是" : "否")"
+        }
+        return "\(summary(camA.device))；\(summary(camB.device))；\(codecDiag)"
     }
 
     /// 刷新各档位可用性（UI 置灰依据）

@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import CoreVideo   // CVPixelBufferGetPixelFormatType（运行时 HDR 校验）
 import Foundation
 import QuartzCore   // CACurrentMediaTime() 显式依赖（避免 SDK 间接导入差异）
 import VideoToolbox // 杜比视界 HDR 压缩属性（HDRMetadataInsertionMode 等）
@@ -36,6 +37,13 @@ final class ModeARecorder: NSObject,
     private var videoConnA: AVCaptureConnection?
     private var videoConnB: AVCaptureConnection?
     weak var manager: CameraManager?
+
+    /// 一次性 HDR 运行时校验：delegate 常驻（不依赖录制状态），首帧实测
+    /// 输出像素格式后上报主线程，供 CameraManager 判断"请求的 10-bit 是否
+    /// 真生效"。会话重配（attach）时重置，保证每次配置后都校验一次。
+    private var didVerifyHDRPipeline = false
+    /// 主线程回调：实测输出是否为 10-bit（P010 VideoRange / FullRange）
+    var onHDRPipelineVerified: ((Bool) -> Void)?
 
     // MARK: - 写入器
 
@@ -109,6 +117,7 @@ final class ModeARecorder: NSObject,
         self.audioOutput = audioOutput
         self.videoConnA = connA
         self.videoConnB = connB
+        didVerifyHDRPipeline = false
     }
 
     func detach() {
@@ -354,11 +363,25 @@ final class ModeARecorder: NSObject,
     ///         兜底配对，把已积压的末尾帧救回文件（修"结尾定格"）。
     private func handleVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer,
                                         connection: AVCaptureConnection) {
+        let isA = (connection === videoConnA)
+        let isB = (connection === videoConnB)
+        // 一次性运行时校验（不依赖录制状态：采集一直在跑，首帧即上报）。
+        // 只在 A 队列执行——A/B 两路独立串行队列并发读写 didVerifyHDRPipeline
+        // 构成数据竞争（外部审核 P1-3）；两路像素格式相同，校验一路即代表会话。
+        if isA, !didVerifyHDRPipeline {
+            didVerifyHDRPipeline = true
+            if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
+                let fmt = CVPixelBufferGetPixelFormatType(pb)
+                let is10Bit = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                    || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                DispatchQueue.main.async { [weak self] in
+                    self?.onHDRPipelineVerified?(is10Bit)
+                }
+            }
+        }
         guard isRecording,
               let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let isA = (connection === videoConnA)
-        let isB = (connection === videoConnB)
         guard isA || isB else { return }
 
         // B 路：只写配对缓冲 + 滑动历史（加锁），让 A 路队列串行消费
