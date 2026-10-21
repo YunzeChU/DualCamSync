@@ -815,19 +815,27 @@ final class CameraManager {
     /// 杜比全链路可用性（**单一判定来源**：applyFormat / attachCompositeOutputs
     /// / refreshDolbyCapability 共用，避免任一环节"判据说可用、实际切不了/设
     /// 不了"的错配——外部审核 P1-1/P2-8）：
-    ///  1. 当前档位两路都有 HDR 采集格式（hdrFormatAvailable）；
+    ///  1. 当前档位两路都有 HDR 采集格式（hdrFormatAvailable）——格式层，
+    ///     真机诊断证实 iPhone 17 Pro 双摄 4K30 均档位HDR≥1；
     ///  2. 当前模式的写入能力：
-    ///     双文件：MovieFileOutput 可用编码器确实含 dvhe；
-    ///     合成：VideoDataOutput 支持 P010 像素格式。
+    ///     双文件：**不再前置判定 dvhe**——availableVideoCodecTypes 依赖
+    ///     连接当前格式（8-bit 连接下恒不含 dvhe），前置判定会与 applyFormat
+    ///     互锁（"先验后切"死锁：验证 dvhe 需 10-bit 连接、切 10-bit 需
+    ///     dvhe 通过；真机诊断 模式B-dvhe:否 即此死锁）。改为"先切后验"
+    ///     （与 CamFusion 同思路）：applyFormat 先切 10-bit，applyOutputCodec
+    ///     在 10-bit 连接上设 dvhe，设不了由安全阀静默回退 HEVC（不闪退）。
+    ///     合成：VideoDataOutput 支持 P010 像素格式（固有能力，不依赖连接
+    ///     配置，保留前置判定）。
     /// 注意：调用方必须先完成输出挂载（attach 后、输出属性已赋值），否则
     /// 输出为 nil 时 allSatisfy 空数组恒 true（安全方向但不完整）。
     private func dolbyCapabilityAvailable() -> Bool {
         guard hdrFormatAvailable() else { return false }
         switch mode {
         case .dualFiles:
-            return [movieOutputA, movieOutputB]
-                .compactMap { $0 }
-                .allSatisfy { $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec) }
+            // 死锁修复（真机诊断：档位HDR1 但 模式B-dvhe:否——8-bit 连接
+            // 下 dvhe 恒不可见）。格式层通过即判可用，dvhe 由
+            // applyOutputCodec 在 10-bit 连接上后验 + 安全阀兜底。
+            return true
         case .composite:
             return [videoDataOutputA, videoDataOutputB]
                 .compactMap { $0 }
@@ -841,16 +849,17 @@ final class CameraManager {
     /// 刷新杜比可用性（UI 置灰依据 + 自动关闭闭环），并在会话配置阶段
     /// 应用对应输出编码器。
     /// 判据：
-    ///  1. 当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 采集格式；
-    ///  2. 按模式区分写入能力——
-    ///     双文件：MovieFileOutput 可用编码器列表确实含 dvhe；
-    ///     合成：AVAssetWriter 走 HEVC Main10 + HDR 属性（无 dvhe 编码器
-    ///     概念），只需数据输出支持 P010 像素格式。
-    /// 双条件与 applyFormat（切 10-bit + 设备 HLG 色域）、
-    /// attachCompositeOutputs（请求 P010）、applyOutputCodec（设 dvhe）
-    /// 行为完全一致，避免"判据说支持、实际切不了/设不了"的错配——错配
-    /// 会让 setOutputSettings(dvhe) 在 8-bit 连接上抛 NSException（真机
-    /// 崩溃报告实锤）。
+    ///  1. 当前档位（preset 尺寸+帧率）两路都有 10-bit HDR 采集格式
+    ///     （格式层；真机诊断证实双摄 4K30 档位HDR≥1）；
+    ///  2. 写入能力按模式区分：
+    ///     双文件：**先切后验**（修复 8-bit 连接下 dvhe 前置判定死锁）——
+    ///     applyFormat 先切 10-bit，applyOutputCodec 在 10-bit 连接上设
+    ///     dvhe，设不了由安全阀静默回退 HEVC（不闪退，防 NSException）；
+    ///     合成：VideoDataOutput 支持 P010 像素格式（固有能力，前置判定）。
+    /// 与 applyFormat（切 10-bit + 设备 HLG 色域）、attachCompositeOutputs
+    /// （请求 P010）同源；applyOutputCodec 的"设 dvhe 前查列表"安全阀防止
+    /// setOutputSettings(dvhe) 在 8-bit 连接上抛 NSException（真机崩溃
+    /// 报告实锤）。
     /// setOutputSettings 与设备 activeFormat/activeColorSpace 都必须在
     /// 会话配置阶段（commit 前）完成，运行中调用会闪退。
     private func refreshDolbyCapability() {
@@ -953,10 +962,13 @@ final class CameraManager {
         let codecDiag: String
         switch mode {
         case .dualFiles:
+            // 标注"10bit连接"：开关关（连接为 8-bit）时显示"否"属正常；
+            // 开关开（applyFormat 已切 10-bit）后重建诊断，此时才是 dvhe
+            // 是否真可用的答案（先切后验，真机验证点）。
             let dvheOK = [movieOutputA, movieOutputB].compactMap { $0 }.allSatisfy {
                 $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec)
             }
-            codecDiag = "模式B-dvhe:\(dvheOK ? "是" : "否")"
+            codecDiag = "模式B-dvhe(10bit连接):\(dvheOK ? "是" : "否")"
         case .composite:
             let p010OK = [videoDataOutputA, videoDataOutputB].compactMap { $0 }.allSatisfy {
                 $0.availableVideoPixelFormatTypes
