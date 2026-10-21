@@ -543,15 +543,19 @@ final class CameraManager {
         // .HLG_BT2020 时 HDR 强制开启（Apple 文档），与系统相机同源行为。
         if dolbyVisionEnabled, isHDRFormat {
             device.activeColorSpace = .HLG_BT2020
-            device.isVideoHDREnabled = true
+            // 不再手动设置 isVideoHDREnabled：真机实测该 setter 抛异常
+            // （SIGABRT，崩溃栈 -[AVCaptureFigVideoDevice setVideoHDREnabled:]
+            // _block_invoke）。iOS 26 上 HDR 使能由 activeColorSpace 托管：
+            // .HLG_BT2020 时系统强制开启 HDR（Apple 文档），无需也不能
+            // 手动置 true。
         } else {
             // 显式复位 SDR（不依赖系统切换 activeFormat 时的隐式回退——
             // 行为未保证）：开过杜比再关（含自动关闭）后，8-bit 格式上
-            // 不允许残留 HLG 色域/HDR 开关，否则 SDR 录制会按 HLG 解释
-            // 8-bit 像素导致偏色发暗（外部审核 P1-2，唯一 SDR 回归点）。
-            // .sRGB 为所有格式支持的基础色域，lock 内设置安全。
+            // 不允许残留 HLG 色域，否则 SDR 录制会按 HLG 解释 8-bit 像素
+            // 导致偏色发暗（外部审核 P1-2，唯一 SDR 回归点）。
+            // .sRGB 为所有格式支持的基础色域，lock 内设置安全；HDR 使能
+            // 随色域自动关闭（.sRGB 非 HDR 色域），同样不手动设置。
             device.activeColorSpace = .sRGB
-            device.isVideoHDREnabled = false
         }
         device.unlockForConfiguration()
     }
