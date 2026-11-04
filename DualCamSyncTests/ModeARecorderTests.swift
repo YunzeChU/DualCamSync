@@ -1,3 +1,4 @@
+import CoreVideo
 import XCTest
 @testable import DualCamSync
 
@@ -24,6 +25,22 @@ final class ModeARecorderTests: XCTestCase {
         try startEmpty(recorder)
         recorder.stop()
         wait(for: [second], timeout: 2)
+    }
+
+    func testStopWaitsForInFlightCaptureCallbacksBeforeFinalizing() throws {
+        let recorder = ModeARecorder()
+        let completed = expectation(description: "empty recording finalizes after input quiescence")
+        let startedAt = Date()
+        recorder.onFinished = { _ in
+            // A callback can be handed off by AVCapture immediately after its connection is
+            // disabled. The recorder must leave a bounded window for it rather than finish
+            // the writer at the stop marker.
+            XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(startedAt), 0.10)
+            completed.fulfill()
+        }
+        try startEmpty(recorder)
+        recorder.stop()
+        wait(for: [completed], timeout: 2)
     }
 
     func testAbortBeforeFirstFrameReportsOnceAndAllowsRestart() throws {
@@ -57,5 +74,20 @@ final class ModeARecorderTests: XCTestCase {
         let recorder = ModeARecorder()
         XCTAssertTrue(recorder.videoQueueA === recorder.videoQueueB)
         XCTAssertTrue(recorder.videoQueueA === recorder.audioQueue)
+    }
+
+    func testHDRValidationAcceptsOnlyP010InputFormats() {
+        XCTAssertEqual(ModeARecorder.validateHDRInputPixelFormat(
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange), .p010)
+        XCTAssertEqual(ModeARecorder.validateHDRInputPixelFormat(
+            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange), .p010)
+        XCTAssertEqual(ModeARecorder.validateHDRInputPixelFormat(
+            kCVPixelFormatType_32BGRA), .unexpectedPixelFormat(kCVPixelFormatType_32BGRA))
+    }
+
+    func testHDRPixelFormatDiagnosticIncludesFourCCAndHexValue() {
+        let diagnostic = ModeARecorder.pixelFormatDiagnostic(kCVPixelFormatType_32BGRA)
+        XCTAssertTrue(diagnostic.contains("BGRA"))
+        XCTAssertTrue(diagnostic.contains("0x"))
     }
 }

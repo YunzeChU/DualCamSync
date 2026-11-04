@@ -33,6 +33,11 @@ final class ModeARecorder: NSObject,
     private var finishing = false
     private var finishWritingStarted = false
     private var accepting = false
+    /// Connections are disabled by CameraManager before `stop()`, but AVCapture may
+    /// already have a callback in flight when that happens. Keep accepting for this
+    /// short, bounded quiescence period so that callback reaches the same drain as
+    /// samples that were already queued on `mediaQueue`.
+    private var awaitingInputQuiescence = false
     private var retryScheduled = false
     private var stopDeadline: CFTimeInterval?
     private typealias Frame = (buffer: CVPixelBuffer, pts: CMTime)
@@ -46,6 +51,7 @@ final class ModeARecorder: NSObject,
     private var backpressureCount = 0
     private var startupSkipped = 0
     private var pendingFailure: Error?
+    private let inputQuiescenceDelay: DispatchTimeInterval = .milliseconds(150)
 
     // MARK: - 会话输出引用（由 CameraManager 注入）
 
@@ -62,6 +68,38 @@ final class ModeARecorder: NSObject,
     private var didVerifyHDRPipeline = false
     /// 主线程回调：实测输出是否为 10-bit（P010 VideoRange / FullRange）
     var onHDRPipelineVerified: ((Bool) -> Void)?
+
+    /// Per-recording evidence, rather than a capability prediction: HDR recording is
+    /// admitted only after each source has delivered a P010 sample to this recorder.
+    private var firstHDRFormatA: OSType?
+    private var firstHDRFormatB: OSType?
+    private var didLogHDRInputVerification = false
+
+    enum HDRInputValidation: Equatable {
+        case p010
+        case unexpectedPixelFormat(OSType)
+    }
+
+    static func validateHDRInputPixelFormat(_ format: OSType) -> HDRInputValidation {
+        switch format {
+        case kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+             kCVPixelFormatType_420YpCbCr10BiPlanarFullRange:
+            return .p010
+        default:
+            return .unexpectedPixelFormat(format)
+        }
+    }
+
+    static func pixelFormatDiagnostic(_ format: OSType) -> String {
+        let bytes = [
+            UInt8((format >> 24) & 0xff), UInt8((format >> 16) & 0xff),
+            UInt8((format >> 8) & 0xff), UInt8(format & 0xff)
+        ]
+        let fourCC = bytes.allSatisfy { (32...126).contains($0) }
+            ? String(bytes: bytes, encoding: .ascii) ?? "????"
+            : "non-printable"
+        return "'\(fourCC)' (0x\(String(format: "%08X", format)))"
+    }
 
     // MARK: - 写入器
 
@@ -235,6 +273,9 @@ final class ModeARecorder: NSObject,
         self.recordingLayout = layout
         self.recordingLandscape = outputSize.width > outputSize.height
         self.recordingHDR = hdr
+        self.firstHDRFormatA = nil
+        self.firstHDRFormatB = nil
+        self.didLogHDRInputVerification = false
         self.recordingPipPosition = pipPosition
         self.recordingPipCornerRadiusRatio = pipCornerRadiusRatio
         self.sessionStartTime = nil
@@ -250,6 +291,7 @@ final class ModeARecorder: NSObject,
         self.unmatchedCount = 0; self.backpressureCount = 0
         self.startupSkipped = 0
         self.stopDeadline = nil
+        self.awaitingInputQuiescence = false
         self.finishWritingStarted = false
         self.retryScheduled = false
         self.pendingFailure = nil
@@ -257,15 +299,24 @@ final class ModeARecorder: NSObject,
     }
 
 
-    // Sample delivery and writer state share mediaQueue. Manager disables source connections
-    // before stop; the queued stop marker follows samples already delivered on this queue.
+    // CameraManager disables source connections before stop. AVCapture can still hand off a
+    // final callback after that operation, so only seal input after a short bounded grace
+    // period; otherwise those final frames are rejected by `accepting` and the movie freezes
+    // before the user pressed stop.
     func stop() {
         mediaQueue.async { [weak self] in
             guard let self, self.isRecording, !self.finishing else { return }
-            self.accepting = false
             self.finishing = true
+            self.awaitingInputQuiescence = true
             self.stopDeadline = CACurrentMediaTime() + 3
             self.pump()
+            let current = self.generation
+            self.mediaQueue.asyncAfter(deadline: .now() + self.inputQuiescenceDelay) { [weak self] in
+                guard let self, self.generation == current, self.finishing else { return }
+                self.awaitingInputQuiescence = false
+                self.accepting = false
+                self.pump()
+            }
         }
     }
 
@@ -363,10 +414,26 @@ final class ModeARecorder: NSObject,
             }
             guard accepting else { return }
             let format = CVPixelBufferGetPixelFormatType(buffer)
-            let tenBit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-                || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
-            guard tenBit == recordingHDR else {
-                fail(CameraError.recordingFailed("采集像素格式与写入设置不一致，已停止以避免错误成片"))
+            let hdrValidation = Self.validateHDRInputPixelFormat(format)
+            if recordingHDR {
+                if isA, firstHDRFormatA == nil { firstHDRFormatA = format }
+                if !isA, firstHDRFormatB == nil { firstHDRFormatB = format }
+                guard hdrValidation == .p010 else {
+                    let source = isA ? "A" : "B"
+                    let detail = "HDR请求未生效：\(source)路首个视频样本为\(Self.pixelFormatDiagnostic(format))，期望P010 10-bit；已停止，未将该样本写入HDR文件"
+                    print("[ModeA][HDR] \(detail)")
+                    fail(CameraError.recordingFailed(detail))
+                    return
+                }
+                if !didLogHDRInputVerification,
+                   let formatA = firstHDRFormatA, let formatB = firstHDRFormatB {
+                    didLogHDRInputVerification = true
+                    print("[ModeA][HDR] capture input verified A=\(Self.pixelFormatDiagnostic(formatA)) B=\(Self.pixelFormatDiagnostic(formatB)); P010 accepted for this recording")
+                }
+            } else if hdrValidation == .p010 {
+                let detail = "SDR写入设置收到P010视频样本（\(Self.pixelFormatDiagnostic(format))），已停止以避免颜色链路不一致"
+                print("[ModeA] \(detail)")
+                fail(CameraError.recordingFailed(detail))
                 return
             }
             // Do not retain hundreds of MB while the microphone is warming up.
@@ -490,7 +557,7 @@ final class ModeARecorder: NSObject,
                 audioSamples.removeFirst()
             }
         }
-        if finishing {
+        if finishing, !awaitingInputQuiescence {
             if !isWriting && pairs.isEmpty {
                 audioSamples.removeAll()
                 finishCurrent()
