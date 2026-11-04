@@ -78,6 +78,68 @@ final class CameraLogicTests: XCTestCase {
         XCTAssertNil(ResolutionPreset.bestAvailablePreset(supports: supports))
     }
 
+    // MARK: - HDR output policy
+
+    func testDolbyMovieOutputDoesNotRequireRedundantCodecSetter() {
+        // HDR is selected by activeFormat/HLG color space. Re-applying the same
+        // HEVC setting to AVCaptureMovieFileOutput can be rejected on device and
+        // must not turn the user-visible HDR switch back off.
+        XCTAssertFalse(CameraManager.movieOutputNeedsCodecSetter(forDolbyEnabled: true))
+        XCTAssertTrue(CameraManager.movieOutputNeedsCodecSetter(forDolbyEnabled: false))
+    }
+
+    // MARK: - 双路 HDR 能力与 SDR 回退诊断
+
+    private func hdrFormat(width: Int32 = 3840, height: Int32 = 2160,
+                           minFPS: Double = 24, maxFPS: Double = 30,
+                           multiCam: Bool = true, hdr: Bool = true,
+                           hlg: Bool = true) -> CameraManager.HDRFormatCapability {
+        .init(width: width, height: height, minimumFPS: minFPS, maximumFPS: maxFPS,
+              supportsMultiCam: multiCam, supportsVideoHDR: hdr,
+              supportsHLGBT2020: hlg)
+    }
+
+    func testHDRCapabilityRequiresBothRoutesToMatchPresetAndHLG() {
+        let supported = hdrFormat()
+        let result = CameraManager.assessHDRCapability(
+            preset: .uhd30, mode: .dualFiles,
+            formatsA: [supported], formatsB: [hdrFormat(hlg: false)]
+        )
+        XCTAssertEqual(result.reason, .noHLGBT2020(.b))
+        XCTAssertFalse(result.isAvailable)
+        XCTAssertTrue(result.sdrFallbackReason.contains("B 路"))
+    }
+
+    func testHDRCapabilityReportsRequestedFrameRateBeforeHDR() {
+        let result = CameraManager.assessHDRCapability(
+            preset: .hd60, mode: .dualFiles,
+            formatsA: [hdrFormat(width: 1920, height: 1080, maxFPS: 30)],
+            formatsB: [hdrFormat(width: 1920, height: 1080, minFPS: 60, maxFPS: 60)]
+        )
+        XCTAssertEqual(result.reason, .noRequestedFormat(.a))
+    }
+
+    func testCompositeHDRCapabilityRequiresP010FromBothOutputs() {
+        let supported = hdrFormat()
+        let result = CameraManager.assessHDRCapability(
+            preset: .uhd30, mode: .composite,
+            formatsA: [supported], formatsB: [supported],
+            compositeP010Support: [true, false]
+        )
+        XCTAssertEqual(result.reason, .noP010Output(.b))
+        XCTAssertFalse(result.isAvailable)
+    }
+
+    func testDualFileHDRCapabilityDoesNotRequireP010DataOutput() {
+        let supported = hdrFormat()
+        let result = CameraManager.assessHDRCapability(
+            preset: .uhd30, mode: .dualFiles,
+            formatsA: [supported], formatsB: [supported]
+        )
+        XCTAssertEqual(result.reason, .ready)
+        XCTAssertTrue(result.isAvailable)
+    }
+
     // MARK: - 错误文案（防 UI 提示被改丢）
 
     func testErrorMessagesAreMeaningful() {

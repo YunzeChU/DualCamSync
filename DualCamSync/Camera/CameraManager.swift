@@ -22,6 +22,95 @@ import Observation
 /// 因此本类不继承 NSObject；CLLocationManagerDelegate 由内部辅助类承担。
 @Observable
 final class CameraManager {
+    // MARK: - HDR capability assessment
+
+    /// A testable snapshot of the parts of an AVCaptureDevice.Format that matter
+    /// to this app's dual-camera HDR pipeline. One format may produce multiple
+    /// snapshots when it advertises multiple frame-rate ranges.
+    struct HDRFormatCapability: Equatable {
+        let width: Int32
+        let height: Int32
+        let minimumFPS: Double
+        let maximumFPS: Double
+        let supportsMultiCam: Bool
+        let supportsVideoHDR: Bool
+        let supportsHLGBT2020: Bool
+    }
+
+    enum HDRCapabilityReason: Equatable {
+        case ready
+        case noRequestedFormat(CameraSlot)
+        case notMultiCamCompatible(CameraSlot)
+        case noHDRFormat(CameraSlot)
+        case noHLGBT2020(CameraSlot)
+        case noP010Output(CameraSlot)
+
+        var message: String {
+            switch self {
+            case .ready:
+                return "两路均具备目标档位的多摄 HDR/HLG 格式"
+            case .noRequestedFormat(let slot):
+                return "\(slot.displayName) 路没有目标分辨率和帧率的格式"
+            case .notMultiCamCompatible(let slot):
+                return "\(slot.displayName) 路目标格式不兼容双摄会话"
+            case .noHDRFormat(let slot):
+                return "\(slot.displayName) 路目标格式不支持视频 HDR"
+            case .noHLGBT2020(let slot):
+                return "\(slot.displayName) 路目标 HDR 格式不支持 HLG/BT.2020"
+            case .noP010Output(let slot):
+                return "\(slot.displayName) 路合成输出不支持 P010 10-bit"
+            }
+        }
+    }
+
+    struct HDRCapabilityAssessment: Equatable {
+        let reason: HDRCapabilityReason
+        var isAvailable: Bool { reason == .ready }
+        var sdrFallbackReason: String { reason.message }
+    }
+
+    /// Decides HDR eligibility without AVFoundation objects, so the exact
+    /// two-camera agreement and SDR fallback reason can be unit tested.
+    static func assessHDRCapability(
+        preset: ResolutionPreset,
+        mode: RecordingMode,
+        formatsA: [HDRFormatCapability],
+        formatsB: [HDRFormatCapability],
+        compositeP010Support: [Bool] = []
+    ) -> HDRCapabilityAssessment {
+        let dimensions = preset.landscapeDimensions
+        let targetFPS = Double(preset.fps)
+
+        func reason(for slot: CameraSlot, formats: [HDRFormatCapability]) -> HDRCapabilityReason? {
+            let requested = formats.filter {
+                $0.width == dimensions.width && $0.height == dimensions.height
+                    && $0.minimumFPS <= targetFPS && targetFPS <= $0.maximumFPS
+            }
+            guard !requested.isEmpty else { return .noRequestedFormat(slot) }
+            let multiCam = requested.filter(\.supportsMultiCam)
+            guard !multiCam.isEmpty else { return .notMultiCamCompatible(slot) }
+            let hdr = multiCam.filter(\.supportsVideoHDR)
+            guard !hdr.isEmpty else { return .noHDRFormat(slot) }
+            guard hdr.contains(where: \.supportsHLGBT2020) else { return .noHLGBT2020(slot) }
+            return nil
+        }
+
+        if let reason = reason(for: .a, formats: formatsA) { return .init(reason: reason) }
+        if let reason = reason(for: .b, formats: formatsB) { return .init(reason: reason) }
+        if mode == .composite {
+            if compositeP010Support.indices.contains(0), !compositeP010Support[0] {
+                return .init(reason: .noP010Output(.a))
+            }
+            if compositeP010Support.indices.contains(1), !compositeP010Support[1] {
+                return .init(reason: .noP010Output(.b))
+            }
+            if compositeP010Support.count != 2 {
+                return .init(reason: .noP010Output(compositeP010Support.isEmpty ? .a : .b))
+            }
+        }
+        return .init(reason: .ready)
+    }
+
     // MARK: - 会话与预览层
 
     /// 多摄会话（支持任意双镜头组合的核心）
@@ -822,11 +911,50 @@ final class CameraManager {
     /// applyFormat 实际切到的格式完全同源。HDR 格式判定使用官方能力标志
     /// isVideoHDRSupported + isMultiCamSupported + HLG/BT.2020 色域）
     private func hdrFormatAvailable() -> Bool {
-        guard let camA = cameraA, let camB = cameraB else { return false }
-        let dims = preset.landscapeDimensions
-        return [camA.device, camB.device].allSatisfy {
-            findHDRFormat(for: $0, width: dims.width, height: dims.height) != nil
+        currentHDRCapabilityAssessment().isAvailable
+    }
+
+    private func hdrFormatCapabilities(for device: AVCaptureDevice) -> [HDRFormatCapability] {
+        device.formats.flatMap { format in
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            return format.videoSupportedFrameRateRanges.map {
+                HDRFormatCapability(
+                    width: dimensions.width,
+                    height: dimensions.height,
+                    minimumFPS: $0.minFrameRate,
+                    maximumFPS: $0.maxFrameRate,
+                    supportsMultiCam: format.isMultiCamSupported,
+                    supportsVideoHDR: format.isVideoHDRSupported,
+                    supportsHLGBT2020: format.supportedColorSpaces.contains(.HLG_BT2020)
+                )
+            }
         }
+    }
+
+    /// One shared assessment powers the UI availability, format selection gate,
+    /// and diagnostic fallback reason. It deliberately requires both routes to
+    /// agree; a partial HDR session is never presented as an HDR option.
+    private func currentHDRCapabilityAssessment() -> HDRCapabilityAssessment {
+        guard let camA = cameraA, let camB = cameraB else {
+            return .init(reason: .noRequestedFormat(.a))
+        }
+        let p010Support: [Bool]
+        switch mode {
+        case .dualFiles:
+            p010Support = []
+        case .composite:
+            p010Support = [videoDataOutputA, videoDataOutputB].map {
+                $0?.availableVideoPixelFormatTypes
+                    .contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange) ?? false
+            }
+        }
+        return Self.assessHDRCapability(
+            preset: preset,
+            mode: mode,
+            formatsA: hdrFormatCapabilities(for: camA.device),
+            formatsB: hdrFormatCapabilities(for: camB.device),
+            compositeP010Support: p010Support
+        )
     }
 
     /// 杜比全链路可用性（**单一判定来源**：applyFormat / attachCompositeOutputs
@@ -846,19 +974,7 @@ final class CameraManager {
     /// 注意：调用方必须先完成输出挂载（attach 后、输出属性已赋值），否则
     /// 输出为 nil 时 allSatisfy 空数组恒 true（安全方向但不完整）。
     private func dolbyCapabilityAvailable() -> Bool {
-        guard hdrFormatAvailable() else { return false }
-        switch mode {
-        case .dualFiles:
-            // 先配置HDR格式，输出使用公开HEVC；最终Dolby元数据以成片验证。
-            return true
-        case .composite:
-            return [videoDataOutputA, videoDataOutputB]
-                .compactMap { $0 }
-                .allSatisfy {
-                    $0.availableVideoPixelFormatTypes
-                        .contains(kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange)
-                }
-        }
+        currentHDRCapabilityAssessment().isAvailable
     }
 
     /// 刷新杜比可用性（UI 置灰依据 + 自动关闭闭环），并在会话配置阶段
@@ -891,13 +1007,15 @@ final class CameraManager {
         }
         // 全链路可用性：格式 + 当前模式写入能力（dvhe/P010），与
         // applyFormat / attachCompositeOutputs 完全同源（外部审核 P1-1）
-        let available = dolbyCapabilityAvailable()
+        let assessment = currentHDRCapabilityAssessment()
+        let available = assessment.isAvailable
         isDolbyVisionAvailable = available
-        hdrFormatDiagnostics = buildHDRDiagnostics()
+        hdrFormatDiagnostics = "\(buildHDRDiagnostics())；HDR判定：\(assessment.sdrFallbackReason)"
+        print("DCS HDR capability preset=\(preset.rawValue) mode=\(mode.rawValue) available=\(available) reason=\(assessment.sdrFallbackReason)")
         if dolbyVisionEnabled && !available {
             dolbyVisionEnabled = false
             persistSettings()   // 自动关闭落盘：下次启动不再恢复开启→再关→重复弹窗
-            showDegradationBanner("当前档位不支持杜比视界，已自动关闭")
+            showDegradationBanner("杜比视界已回退普通录制：\(assessment.sdrFallbackReason)")
         }
         let codecOK = try applyOutputCodec(useDolby: dolbyVisionEnabled && available)
         // 名不副实防护（外部审查 P3）：applyFormat 已按"先切后验"切了 10-bit
@@ -919,11 +1037,20 @@ final class CameraManager {
 
     /// 使用公开 HEVC 编码类型；Dolby Vision 8.4 不是另一个 capture codec。
     /// 只允许在会话配置阶段（commitConfiguration 之前）调用。
-    /// 检查连接允许键及可用编码器，再通过窄ObjC异常边界调用。
-    /// 返回false表示HDR设置失败，调用方恢复两路SDR；SDR也失败则抛错。
+    ///
+    /// HDR 不向 `AVCaptureMovieFileOutput` 重复写入 HEVC 设置。该输出已
+    /// 默认选择 HEVC；HDR 由两台设备的 activeFormat + HLG/BT.2020 色域
+    /// 驱动。真机上即使开关前可用，重写相同的 codec setting 仍可能被
+    /// MovieFileOutput 拒绝；把这个可选 setter 当成 HDR 能力条件会令开关
+    /// 立即回弹。SDR 配置仍显式请求 HEVC，以保留既有的降级路径。
+    /// 输出设置失败会抛出配置错误；HDR 路径不依赖此 setter。
     private func applyOutputCodec(useDolby: Bool) throws -> Bool {
         guard mode == .dualFiles, let outA = movieOutputA, let outB = movieOutputB else { return true }
-        var allDolby = true
+        if !Self.movieOutputNeedsCodecSetter(forDolbyEnabled: useDolby) {
+            // Do not call setOutputSettings here. AVCaptureMovieFileOutput owns
+            // its HEVC encoder selection; HDR is selected at the capture device.
+            return true
+        }
         for out in [outA, outB] {
             let codec: AVVideoCodecType = .hevc
             guard out.availableVideoCodecTypes.contains(codec) else {
@@ -938,12 +1065,17 @@ final class CameraManager {
                 print("DCS codec requested=\(codec.rawValue) available=\(out.availableVideoCodecTypes.map(\.rawValue)) running=\(session.isRunning) ports=\(conn.inputPorts.map { $0.sourceDeviceType?.rawValue ?? "unknown" })")
                 if let reason = CaptureOutputSettingsGuard.failure(forSettings: [AVVideoCodecKey: codec], output: out, connection: conn) {
                     print("DCS codec rejected: \(reason)")
-                    if useDolby { allDolby = false }
-                    else { throw CameraError.configurationFailed("录像编码设置失败：\(reason)") }
+                    throw CameraError.configurationFailed("录像编码设置失败：\(reason)")
                 }
             }
         }
-        return allDolby
+        return true
+    }
+
+    /// MovieFileOutput 的 HDR 路径不能把“重复设置 HEVC 成功”当作能力门槛。
+    /// 单测覆盖这个策略，防止日后改回导致 HDR 开关再次回弹。
+    static func movieOutputNeedsCodecSetter(forDolbyEnabled enabled: Bool) -> Bool {
+        !enabled
     }
 
     /// 查找与当前宽高匹配、且支持目标帧率的 10-bit HDR 格式
