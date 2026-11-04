@@ -935,7 +935,7 @@ final class CameraManager {
                     if useDolby { return false }
                     throw CameraError.configurationFailed("当前视频连接不接受编码格式设置")
                 }
-                print("DCS codec requested=\(codec.rawValue) available=\(out.availableVideoCodecTypes.map(\.rawValue)) running=\(session.isRunning) ports=\(conn.inputPorts.map { $0.sourceDeviceType.rawValue })")
+                print("DCS codec requested=\(codec.rawValue) available=\(out.availableVideoCodecTypes.map(\.rawValue)) running=\(session.isRunning) ports=\(conn.inputPorts.map { $0.sourceDeviceType?.rawValue ?? "unknown" })")
                 if let reason = CaptureOutputSettingsGuard.failure(forSettings: [AVVideoCodecKey: codec], output: out, connection: conn) {
                     print("DCS codec rejected: \(reason)")
                     if useDolby { allDolby = false }
