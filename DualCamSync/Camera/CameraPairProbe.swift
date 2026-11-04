@@ -47,7 +47,7 @@ final class CameraPairProbe {
         } catch {
             // 探测异常（如设备繁忙/输入构造失败）→ 收尾会话配置后放行，
             // 交给运行期兜底，避免整个选摄列表被置灰、切换镜头按钮点不动。
-            probeSession.commitConfiguration()
+            // Input construction throws before beginConfiguration; no commit is due.
             lock.lock()
             cache[key] = true
             lock.unlock()
@@ -55,12 +55,16 @@ final class CameraPairProbe {
         }
     }
 
-    /// 某台设备是否支持目标分辨率/帧率档位
+    /// 某台设备是否支持目标分辨率/帧率档位（多摄会话口径）
+    /// 与 HDR 判据同口径：只认 format.isMultiCamSupported 的格式（外部审查
+    /// P2：单摄支持、但不支持 MultiCam 的格式在双摄会话配置/运行时会出错，
+    /// 不应显示为可选档位）。
     func supportsPreset(_ device: AVCaptureDevice, _ preset: ResolutionPreset) -> Bool {
         let dims = preset.landscapeDimensions
         return device.formats.contains { format in
             let fd = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
-            return fd.width == dims.width && fd.height == dims.height
+            return format.isMultiCamSupported
+                && fd.width == dims.width && fd.height == dims.height
                 && format.videoSupportedFrameRateRanges.contains { range in
                     range.minFrameRate <= Double(preset.fps) && Double(preset.fps) <= range.maxFrameRate
                 }

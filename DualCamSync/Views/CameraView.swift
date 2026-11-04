@@ -266,6 +266,12 @@ struct CameraView: View {
         return CGSize(width: w, height: h)
     }
 
+    /// 画中画小窗内边距（与渲染处 .padding(20) 一一对应）。
+    /// 渲染链：.padding(20) 在 topLeading 对齐的 frame 内会把小窗内容再内推
+    /// 20pt，位置/clamp 计算必须纳入，否则"预览位置 = 成片位置"会整体偏移
+    /// 约 20pt（外部审查 P7：基准不统一导致小窗相对成片向左上偏）。
+    private let pipInnerInset: CGFloat = 20
+
     /// 计算小窗当前的归一化中心位置（0~1，y 从顶部算，与 SwiftUI 一致）。
     /// 基准 = 左上角默认位置（与 previewArea 的 padding、clampPipOffset 同一套
     /// 常量），叠加拖动偏移；录制开始前由 controlOverlay 写入
@@ -273,8 +279,8 @@ struct CameraView: View {
     private func currentPipNormalizedPosition(geo: GeometryProxy, isLandscape: Bool) -> CGPoint {
         let size = geo.size
         let window = pipWindowSize(geo, isLandscape)
-        let baseX: CGFloat = isLandscape ? 24 : 16
-        let baseY: CGFloat = isLandscape ? 24 : 60
+        let baseX: CGFloat = (isLandscape ? 24 : 16) + pipInnerInset
+        let baseY: CGFloat = (isLandscape ? 24 : 60) + pipInnerInset
         // 归并 pipOffset + 未松手的 pipDragOffset：手指按住没松就点录制时，
         // 写入的位置也是小窗实际渲染位置（预览 = 成片）
         let centerX = baseX + ui.pipOffset.width + ui.pipDragOffset.width + window.width / 2
@@ -283,12 +289,13 @@ struct CameraView: View {
     }
 
     /// 把小窗偏移限制在屏内（完整可见，四周留 8pt 边距）
-    /// 基准与 PIP 小窗默认位置一致（左上角：竖屏顶 60/左 16、横屏顶 24/左 24），
-    /// 保证拖放手感连续、旋转后 clamp 回到左上角默认区域。
+    /// 基准与 PIP 小窗默认位置一致（左上角：竖屏顶 60/左 16、横屏顶 24/左 24，
+    /// 各再加 pipInnerInset 内推），保证拖放手感连续、旋转后 clamp 回到左上角
+    /// 默认区域。
     private func clampPipOffset(to size: CGSize, window: CGSize, isLandscape: Bool) {
         // 无偏移时小窗位于左上角默认位置（距顶/距左见 previewArea 的 padding）
-        let baseX: CGFloat = isLandscape ? 24 : 16
-        let baseY: CGFloat = isLandscape ? 24 : 60
+        let baseX: CGFloat = (isLandscape ? 24 : 16) + pipInnerInset
+        let baseY: CGFloat = (isLandscape ? 24 : 60) + pipInnerInset
         let minOX = 8 - baseX
         let maxOX = (size.width - window.width - 8) - baseX
         let minOY = 8 - baseY

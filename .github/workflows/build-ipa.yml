@@ -57,6 +57,8 @@ jobs:
             -configuration Release \
             -destination 'generic/platform=iOS' \
             -derivedDataPath build \
+            CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
+            DCS_GIT_REVISION="$GITHUB_SHA" \
             CODE_SIGNING_ALLOWED=NO \
             build
 
@@ -66,9 +68,26 @@ jobs:
           cp -R "build/Build/Products/Release-iphoneos/DualCamSync.app" Payload/
           zip -r DualCamSync.ipa Payload/
 
+      - name: Record build provenance
+        run: |
+          python3 - <<'PY'
+          import json, os, plistlib
+          from pathlib import Path
+          with open('Payload/DualCamSync.app/Info.plist', 'rb') as source:
+              info = plistlib.load(source)
+          expected = os.environ['GITHUB_SHA']
+          assert info['DCSGitRevision'] == expected
+          assert str(info['CFBundleVersion']) == os.environ['GITHUB_RUN_NUMBER']
+          data = {'commit': expected, 'run_id': os.environ['GITHUB_RUN_ID'],
+                  'build': info['CFBundleVersion'], 'signed': False}
+          Path('build-provenance.json').write_text(json.dumps(data, indent=2))
+          PY
+
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: DualCamSync-unsigned-ipa
-          path: DualCamSync.ipa
+          path: |
+            DualCamSync.ipa
+            build-provenance.json
           if-no-files-found: error

@@ -60,11 +60,11 @@ final class CameraManager {
     var exposureBias: [Float] = [0, 0]      // 每路曝光补偿
 
     var isRecording = false
+    var isStarting = false
     /// 成片收尾中（点停止后文件仍在异步写入/保存；期间禁止再次开始录制）
     var isFinalizing = false
     /// 收尾代际：每次 startRecording +1，录制器回调捕获当时的代际值。
-    /// 防止"stopRecording 3 秒兜底复位 isFinalizing 后，用户已开始新录制，
-    /// 而旧录制的 didFinish/finishWriting 回调迟到"时误停新录制/误复位状态。
+    /// 完成回调及收尾提示都绑定本次代际；等待收尾时不允许开始下一段。
     private var finalizeToken = 0
     var recordingElapsed: TimeInterval = 0
     var interfaceOrientation: UIInterfaceOrientation = .portrait
@@ -178,9 +178,22 @@ final class CameraManager {
             // 拍摄地点不需要高精度，百米级即可，省电且无需高精度权限
             locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
             locationManager.requestWhenInUseAuthorization()
-        default:
-            break   // 已授权则直接用 lastLocation（可能为 nil 时视频不带定位）
+        case .authorizedWhenInUse, .authorizedAlways:
+            // 已授权：主动单次取位刷新 lastLocation（外部审查 P4——原先
+            // 此分支什么都不做，保存时用的是可能 nil 或陈旧的 lastLocation）
+            locationManager.desiredAccuracy = kCLLocationAccuracyHundredMeters
+            locationManager.requestLocation()
+        @unknown default:
+            break
         }
+    }
+
+    /// 最近 10 分钟内取得的定位才视为有效（外部审查 P4：陈旧定位不应写入
+    /// 新录制的视频元数据；超期/缺失返回 nil，保存时不带地点并提示）
+    private func freshLocation() -> CLLocation? {
+        guard let loc = lastLocation,
+              Date().timeIntervalSince(loc.timestamp) < 600 else { return nil }
+        return loc
     }
 
     // MARK: - 初始化
@@ -370,7 +383,7 @@ final class CameraManager {
             // 防抖 / 方向 / 杜比（输出编码器必须在 commit 前设置）
             applyStabilization()
             applyOrientation()
-            refreshDolbyCapability()
+            try refreshDolbyCapability()
 
             session.commitConfiguration()
             session.startRunning()
@@ -409,6 +422,7 @@ final class CameraManager {
             }
         } catch {
             session.commitConfiguration()
+            session.stopRunning()
             self.error = (error as? CameraError) ?? .configurationFailed(error.localizedDescription)
         }
     }
@@ -516,9 +530,12 @@ final class CameraManager {
             isHDRFormat = format != nil
         }
         if format == nil {
+            // SDR 回退同样只选多摄兼容格式：与 HDR 判据 isMultiCamSupported
+            // 同口径（外部审查 P2——单摄格式在双摄会话配置/运行时会出错）
             format = device.formats.first(where: { f in
                 let fd = CMVideoFormatDescriptionGetDimensions(f.formatDescription)
-                return fd.width == dims.width && fd.height == dims.height
+                return f.isMultiCamSupported
+                    && fd.width == dims.width && fd.height == dims.height
                     && f.videoSupportedFrameRateRanges.contains {
                         $0.minFrameRate <= targetFPS && targetFPS <= $0.maxFrameRate
                     }
@@ -629,7 +646,7 @@ final class CameraManager {
             conn.isVideoMirrored = false
             // 默认 HEVC；杜比视界由 refreshDolbyCapability 覆盖
             if belongs {
-                output.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: conn)
+                // Codec configuration is applied once, after formats are selected.
             }
         }
     }
@@ -692,7 +709,9 @@ final class CameraManager {
             self.hdrPipelineVerified = true
             self.hdrPipelineOK = ok
             if expectedHDR && !isP010 {
-                self.degradationBanner = "杜比采集未生效：输出非 10-bit，本段实际按 SDR 写入"
+                let error = CameraError.recordingFailed("HDR 采集未输出 10-bit，已停止以避免错误成片；请关闭 HDR 后重试")
+                if self.isRecording { self.abortActiveRecording(error) }
+                else { self.error = error }
             }
         }
         // 录制完成/失败回调由 startRecording 按"收尾代际"统一设置
@@ -793,9 +812,7 @@ final class CameraManager {
         return false
     }
 
-    /// 杜比视界 HEVC 码型
-    /// iOS 26 SDK 未暴露 AVVideoCodecType 静态成员，用 rawValue("dvhe") 构造（等价常量）
-    private static let dolbyVisionCodec = AVVideoCodecType(rawValue: "dvhe")
+    // Dolby Vision 8.4 uses HEVC; a sample-entry FourCC is not a capture codec API.
 
     /// 杜比视界能力探测 + 输出编码器设置（**必须在 commitConfiguration 之前调用**）
     /// -----------------------------------------------------------------------
@@ -832,9 +849,7 @@ final class CameraManager {
         guard hdrFormatAvailable() else { return false }
         switch mode {
         case .dualFiles:
-            // 死锁修复（真机诊断：档位HDR1 但 模式B-dvhe:否——8-bit 连接
-            // 下 dvhe 恒不可见）。格式层通过即判可用，dvhe 由
-            // applyOutputCodec 在 10-bit 连接上后验 + 安全阀兜底。
+            // 先配置HDR格式，输出使用公开HEVC；最终Dolby元数据以成片验证。
             return true
         case .composite:
             return [videoDataOutputA, videoDataOutputB]
@@ -862,7 +877,7 @@ final class CameraManager {
     /// 报告实锤）。
     /// setOutputSettings 与设备 activeFormat/activeColorSpace 都必须在
     /// 会话配置阶段（commit 前）完成，运行中调用会闪退。
-    private func refreshDolbyCapability() {
+    private func refreshDolbyCapability() throws {
         guard cameraA != nil, cameraB != nil else {
             let wasAvailable = isDolbyVisionAvailable
             isDolbyVisionAvailable = false
@@ -871,7 +886,7 @@ final class CameraManager {
                 persistSettings()   // 自动关闭落盘：下次启动不再恢复开启→再关→重复弹窗
                 if wasAvailable { showDegradationBanner("杜比视界当前不可用，已自动关闭") }
             }
-            applyOutputCodec(useDolby: false)
+            _ = try applyOutputCodec(useDolby: false)
             return
         }
         // 全链路可用性：格式 + 当前模式写入能力（dvhe/P010），与
@@ -884,26 +899,51 @@ final class CameraManager {
             persistSettings()   // 自动关闭落盘：下次启动不再恢复开启→再关→重复弹窗
             showDegradationBanner("当前档位不支持杜比视界，已自动关闭")
         }
-        applyOutputCodec(useDolby: dolbyVisionEnabled && available)
-    }
-
-    /// 设置 MovieFileOutput 输出编码器（hevc / dvhe）。
-    /// 只允许在会话配置阶段（commitConfiguration 之前）调用。
-    /// 安全阀：AVCaptureMovieFileOutput 对**不支持的编码器**直接抛 NSException
-    /// （真机崩溃报告：setOutputSettings(dvhe) → objc_exception_throw →
-    /// SIGABRT），NSException 无法用 Swift do-catch 捕获，只能"预防"——
-    /// 每个输出先查 availableVideoCodecTypes 是否含目标码型，不含则静默
-    /// 退回 HEVC，保证杜比开关无论设备/档位如何都不会导致闪退。
-    private func applyOutputCodec(useDolby: Bool) {
-        guard mode == .dualFiles, let outA = movieOutputA, let outB = movieOutputB else { return }
-        for out in [outA, outB] {
-            let codec: AVVideoCodecType =
-                (useDolby && out.availableVideoCodecTypes.contains(Self.dolbyVisionCodec))
-                ? Self.dolbyVisionCodec : .hevc
-            for conn in out.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
-                out.setOutputSettings([AVVideoCodecKey: codec], for: conn)
+        let codecOK = try applyOutputCodec(useDolby: dolbyVisionEnabled && available)
+        // 名不副实防护（外部审查 P3）：applyFormat 已按"先切后验"切了 10-bit
+        // 采集（refresh 在其后执行），但 dvhe 编码器在 10-bit 连接上仍不可用
+        // → UI 显示已开、实际编码 HEVC 的错配必须消除：关闭开关 + 弹窗 +
+        // 同一配置周期内把两路回退 8-bit（仍在 begin/commit 之间，安全）。
+        if dolbyVisionEnabled && !codecOK {
+            dolbyVisionEnabled = false
+            persistSettings()
+            isDolbyVisionAvailable = false
+            showDegradationBanner("当前输出不接受 HDR 编码设置，已回退普通录制")
+            if let camA = cameraA, let camB = cameraB {
+                try applyFormat(device: camA.device, preset: preset)
+                try applyFormat(device: camB.device, preset: preset)
+                _ = try applyOutputCodec(useDolby: false)
             }
         }
+    }
+
+    /// 使用公开 HEVC 编码类型；Dolby Vision 8.4 不是另一个 capture codec。
+    /// 只允许在会话配置阶段（commitConfiguration 之前）调用。
+    /// 检查连接允许键及可用编码器，再通过窄ObjC异常边界调用。
+    /// 返回false表示HDR设置失败，调用方恢复两路SDR；SDR也失败则抛错。
+    private func applyOutputCodec(useDolby: Bool) throws -> Bool {
+        guard mode == .dualFiles, let outA = movieOutputA, let outB = movieOutputB else { return true }
+        var allDolby = true
+        for out in [outA, outB] {
+            let codec: AVVideoCodecType = .hevc
+            guard out.availableVideoCodecTypes.contains(codec) else {
+                if useDolby { return false }
+                throw CameraError.configurationFailed("当前录像输出不支持 HEVC")
+            }
+            for conn in out.connections where conn.isEnabled && conn.inputPorts.first?.mediaType == .video {
+                guard out.supportedOutputSettingsKeys(for: conn).contains(AVVideoCodecKey) else {
+                    if useDolby { return false }
+                    throw CameraError.configurationFailed("当前视频连接不接受编码格式设置")
+                }
+                print("DCS codec requested=\(codec.rawValue) available=\(out.availableVideoCodecTypes.map(\.rawValue)) running=\(session.isRunning) ports=\(conn.inputPorts.map { $0.sourceDeviceType.rawValue })")
+                if let reason = CaptureOutputSettingsGuard.failure(forSettings: [AVVideoCodecKey: codec], output: out, connection: conn) {
+                    print("DCS codec rejected: \(reason)")
+                    if useDolby { allDolby = false }
+                    else { throw CameraError.configurationFailed("录像编码设置失败：\(reason)") }
+                }
+            }
+        }
+        return allDolby
     }
 
     /// 查找与当前宽高匹配、且支持目标帧率的 10-bit HDR 格式
@@ -966,9 +1006,9 @@ final class CameraManager {
             // 开关开（applyFormat 已切 10-bit）后重建诊断，此时才是 dvhe
             // 是否真可用的答案（先切后验，真机验证点）。
             let dvheOK = [movieOutputA, movieOutputB].compactMap { $0 }.allSatisfy {
-                $0.availableVideoCodecTypes.contains(Self.dolbyVisionCodec)
+                $0.availableVideoCodecTypes.contains(.hevc)
             }
-            codecDiag = "模式B-dvhe(10bit连接):\(dvheOK ? "是" : "否")"
+            codecDiag = "模式B-HEVC:\(dvheOK ? "是" : "否")（杜比元数据待成片验证）"
         case .composite:
             let p010OK = [videoDataOutputA, videoDataOutputB].compactMap { $0 }.allSatisfy {
                 $0.availableVideoPixelFormatTypes
@@ -1273,6 +1313,10 @@ final class CameraManager {
             error = .recordingFailed("相机会话未就绪，请稍后重试")
             return
         }
+        guard !compositeOutputIsHDR || !hdrPipelineVerified || hdrPipelineOK else {
+            error = .recordingFailed("HDR 采集格式校验失败，请关闭 HDR 后重试")
+            return
+        }
         do {
             // 录制前把两路录制输出的**全部启用视频连接**方向对齐到当前界面方向，
             // 保证 A/B 两路成片朝向一致、与预览一致（修复一路横一路竖）。
@@ -1285,7 +1329,6 @@ final class CameraManager {
             let token = finalizeToken
             switch mode {
             case .dualFiles:
-                try modeBRecorder.start()
                 modeBRecorder.onFinished = { [weak self] urls in
                     self?.handleRecordingFinished(urls: urls, token: token)
                 }
@@ -1293,6 +1336,7 @@ final class CameraManager {
                     self?.handleRecordingFailed(err, successURLs: successURLs,
                                                 failedURLs: failedURLs, token: token)
                 }
+                try modeBRecorder.start()
             case .composite:
                 // 先启用两路视频 + 音频数据输出连接（source 端开始派发样本，
                 // 供 ModeARecorder 帧配对 + 合成）。用 compositeVideoConnA/B
@@ -1302,21 +1346,30 @@ final class CameraManager {
                 compositeVideoConnB?.isEnabled = true
                 audioDataOutput?.connection(with: .audio)?.isEnabled = true
                 let target = targetOutputDimensions()
-                try modeARecorder.start(outputSize: target,
-                                        layout: layout,
-                                        audioFormat: microphoneAudioFormat(),
-                                        pipPosition: pipPosition,
-                                        pipCornerRadiusRatio: pipCornerRadiusRatio,
-                                        hdr: compositeOutputIsHDR)
+                modeARecorder.onStarted = { [weak self] in
+                    guard let self, self.finalizeToken == token, self.isRecording else { return }
+                    self.isStarting = false
+                    self.startElapsedTimer()
+                }
+                modeARecorder.onPartialFinished = { [weak self] url, error in
+                    self?.handleRecordingFailed(error, successURLs: [url], token: token)
+                }
                 modeARecorder.onFinished = { [weak self] urls in
                     self?.handleRecordingFinished(urls: urls, token: token)
                 }
                 modeARecorder.onError = { [weak self] err in
                     self?.handleRecordingFailed(err, token: token)
                 }
+                try modeARecorder.start(outputSize: target,
+                                        layout: layout,
+                                        audioFormat: microphoneAudioFormat(),
+                                        pipPosition: pipPosition,
+                                        pipCornerRadiusRatio: pipCornerRadiusRatio,
+                                        hdr: compositeOutputIsHDR)
             }
             isRecording = true
-            startElapsedTimer()
+            isStarting = mode == .composite
+            if !isStarting { startElapsedTimer() }
         } catch {
             self.error = (error as? CameraError) ?? .recordingFailed(error.localizedDescription)
         }
@@ -1325,12 +1378,11 @@ final class CameraManager {
     /// 停止录制（保存由录制器回调统一触发）
     /// 点按立即复位 UI（按钮/计时），成片由录制器异步收尾并保存——
     /// 修复"点停止后要空等约 1 秒才终止"的卡顿感。
-    /// 兜底：收尾回调（didFinishRecordingTo / finishWriting）异常丢失时
-    /// 3 秒后强制复位 isFinalizing，避免"上一段视频正在保存"永久卡死
-    /// （isFinalizing 卡死会把录制键、功能/设置键全部禁用 = "设置栏打不开"）。
+    /// 收尾超时只提示，不提前复用仍在写文件的录制器。
     func stopRecording() {
         guard isRecording else { return }
         isFinalizing = true
+        isStarting = false
         stopElapsedTimer()
         isRecording = false
         switch mode {
@@ -1347,9 +1399,10 @@ final class CameraManager {
             audioDataOutput?.connection(with: .audio)?.isEnabled = false
             modeARecorder.stop()
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-            guard let self, self.isFinalizing else { return }
-            self.isFinalizing = false
+        let token = finalizeToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 10) { [weak self] in
+            guard let self, self.isFinalizing, self.finalizeToken == token else { return }
+            self.showDegradationBanner("视频仍在收尾，请稍候；为保护文件暂不能开始下一段")
         }
     }
 
@@ -1390,15 +1443,21 @@ final class CameraManager {
         guard token == finalizeToken else { return }
         stopElapsedTimer()
         isRecording = false
+        isStarting = false
         isFinalizing = false
         applyPendingDowngrade()   // 内存告警等触发的"录制结束后降级"在此闭环
         guard !urls.isEmpty else { return }
-        if includeLocation { requestLocationIfNeeded() }   // 保存场景才请求定位
+        // 保存前取"10 分钟内新鲜"的定位；requestLocationIfNeeded 异步刷新
+        // 是给下一段录制预热的（外部审查 P4：先请求后立即保存会写入 nil/旧值）
+        let location = includeLocation ? freshLocation() : nil
+        if includeLocation { requestLocationIfNeeded() }
+        let locationMissing = includeLocation && location == nil
         PhotoLibrarySaver.saveVideos(at: urls,
-                                     location: includeLocation ? lastLocation : nil) { [weak self] savedURLs, failedURLs in
+                                     location: location) { [weak self] savedURLs, failedURLs in
             guard let self else { return }
             if failedURLs.isEmpty {
-                self.showDegradationBanner("已保存 \(savedURLs.count) 段视频到相册")
+                self.showDegradationBanner("已保存 \(savedURLs.count) 段视频到相册"
+                    + (locationMissing ? "（本段未获取到拍摄地点，未写入）" : ""))
             } else if savedURLs.isEmpty {
                 self.error = .recordingFailed(
                     "视频保存失败，文件位于 \(failedURLs.map(\.lastPathComponent).joined(separator: "、"))（临时目录）")
@@ -1427,16 +1486,20 @@ final class CameraManager {
         if let token, token != finalizeToken { return }
         stopElapsedTimer()
         isRecording = false
+        isStarting = false
         isFinalizing = false
         applyPendingDowngrade()
         // 模式B一路失败、另一路成功：成功文件仍保存到相册（不丢弃）
         if !successURLs.isEmpty {
-            if includeLocation { requestLocationIfNeeded() }   // 保存场景才请求定位
+            let location = includeLocation ? freshLocation() : nil
+            if includeLocation { requestLocationIfNeeded() }   // 为下一段录制预热定位
+            let locationMissing = includeLocation && location == nil
             PhotoLibrarySaver.saveVideos(at: successURLs,
-                                         location: includeLocation ? lastLocation : nil) { [weak self] savedURLs, savedFailed in
+                                         location: location) { [weak self] savedURLs, savedFailed in
                 guard let self else { return }
                 if savedFailed.isEmpty {
-                    self.showDegradationBanner("一路录制失败；成功的一段已保存到相册")
+                    self.showDegradationBanner("一路录制失败；成功的一段已保存到相册"
+                        + (locationMissing ? "（本段未获取到拍摄地点，未写入）" : ""))
                 } else {
                     self.showDegradationBanner("一路录制失败；成功的一段也未能保存，文件位于临时目录")
                 }
@@ -1552,9 +1615,29 @@ final class CameraManager {
                 // userInfo 中的错误是 NSError（Swift 桥接 as? AVError 在部分系统下会失败），
                 // 统一按 NSError 读取，保证异常分支稳定。
                 if let err = note.userInfo?["AVCaptureSessionErrorKey"] as? NSError {
-                    self?.handleRecordingFailed(err)
+                    self?.abortActiveRecording(err)
                 }
             })
+    }
+
+    private func abortActiveRecording(_ error: Error) {
+        guard isRecording || isFinalizing else {
+            self.error = .configurationFailed(error.localizedDescription)
+            return
+        }
+        isRecording = false
+        isFinalizing = true
+        isStarting = false
+        stopElapsedTimer()
+        switch mode {
+        case .composite:
+            compositeVideoConnA?.isEnabled = false
+            compositeVideoConnB?.isEnabled = false
+            audioDataOutput?.connection(with: .audio)?.isEnabled = false
+            modeARecorder.abort(error: error)
+        case .dualFiles:
+            modeBRecorder.abort(error: error)
+        }
     }
 
     /// 释放时停止会话并移除全部通知观察者

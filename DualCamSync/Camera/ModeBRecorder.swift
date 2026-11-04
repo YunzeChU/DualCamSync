@@ -1,119 +1,115 @@
 import AVFoundation
 import Foundation
 
-/// 模式B：双独立文件录制器
-/// -------------------------------------------------------------
-/// 使用两个 AVCaptureMovieFileOutput（各自只启用自己那路视频连接 + 共享音频），
-/// 在"同一瞬间"分别调用 startRecording：
-///   - 两路文件起点一致、共享同一会话时钟 => 时间戳同源对齐，帧级同步；
-///   - 每个文件内的音视频混流由 AVFoundation 内部完成，音画同步由框架保证；
-///   - 两路文件携带的是同一条麦克风音轨（与需求一致）。
-///
-/// 空间音频（First Order Ambisonics）在会话配置阶段由 CameraManager
-/// 通过 multichannelAudioMode 开启，MovieFileOutput 自动写出
-/// "空间音频轨 + 立体声兼容轨"，本类无需额外处理。
+/// 每段捕获独立输出、URL 和回调；保留原 MovieFileOutput 空间音频路径。
 final class ModeBRecorder: NSObject, AVCaptureFileOutputRecordingDelegate {
-
     private var outputA: AVCaptureMovieFileOutput?
     private var outputB: AVCaptureMovieFileOutput?
-    private var currentURLs: [URL] = []
-    /// 两个输出可能在不同线程并发回调完成事件，计数与错误需加锁保护
     private let finishLock = NSLock()
-    private var finishedCount = 0
-    private var pendingError: Error?
-    /// 已成功完成录制的文件（一路失败时，另一路成功文件仍应保存到相册）
-    private var finishedSuccessURLs: [URL] = []
-
-    /// 两路都录制完成（主线程回调）
-    var onFinished: (([URL]) -> Void)?
-    /// 任一路失败（主线程回调）；附带另一路成功文件与失败文件列表
-    /// （失败文件保留在临时目录，错误提示需带上路径便于用户找回）
-    var onError: ((Error, [URL], [URL]) -> Void)?
-
-    var isRecording: Bool {
-        outputA?.isRecording == true || outputB?.isRecording == true
+    private var active: Context?
+    private final class Context {
+        let outputs: [AVCaptureMovieFileOutput]
+        let urls: [URL]
+        let finished: (([URL]) -> Void)?
+        let failed: ((Error, [URL], [URL]) -> Void)?
+        var completed = Set<Int>()
+        var successful = Set<Int>()
+        var error: Error?
+        init(outputs: [AVCaptureMovieFileOutput], urls: [URL],
+             finished: (([URL]) -> Void)?, failed: ((Error, [URL], [URL]) -> Void)?) {
+            self.outputs = outputs
+            self.urls = urls
+            self.finished = finished
+            self.failed = failed
+        }
     }
-
-    // MARK: - 挂载/卸载
-
+    /// 开始时捕获，调用方必须在 start 前设置。
+    var onFinished: (([URL]) -> Void)?
+    var onError: ((Error, [URL], [URL]) -> Void)?
+    var isRecording: Bool {
+        finishLock.lock()
+        defer { finishLock.unlock() }
+        return active != nil
+    }
     func attach(outputA: AVCaptureMovieFileOutput, outputB: AVCaptureMovieFileOutput) {
         self.outputA = outputA
         self.outputB = outputB
     }
-
     func detach() {
         outputA = nil
         outputB = nil
+        // active 保留旧输出，直到其真实回调完成。
     }
-
-    // MARK: - 录制控制
-
-    /// 同时启动两路录制（两路时间线同源，帧级对齐）
-    /// 注意：startRecording(to:recordingDelegate:) 返回 **Void**（并非 Bool），
-    /// 启动失败会经 didFinishRecordingTo 完成回调携带 error 上报。
-    /// 因此"双输出启动校验"由 fileOutput 完成回调统一处理：
-    /// 任一路报错立即停止另一路（避免一路失败另一路空录）。
     func start() throws {
         guard let outputA, let outputB else {
-            // 静默返回 = 录制键点了毫无反应（用户反复反馈"录制键没有变化"）。
-            // 必须抛错给上层弹窗说明原因。
             throw CameraError.recordingFailed("录制输出未就绪，请重新选择镜头组合")
         }
-        guard !outputA.isRecording, !outputB.isRecording else {
+        finishLock.lock()
+        guard active == nil, !outputA.isRecording, !outputB.isRecording else {
+            finishLock.unlock()
             throw CameraError.recordingFailed("上一段视频仍在收尾，请稍候")
         }
+        let id = UUID().uuidString
         let dir = FileManager.default.temporaryDirectory
-        let stamp = Int(Date().timeIntervalSince1970 * 1000)
-        let urlA = dir.appendingPathComponent("DCS_\(stamp)_A.mp4")
-        let urlB = dir.appendingPathComponent("DCS_\(stamp)_B.mp4")
-        currentURLs = [urlA, urlB]
-        finishedCount = 0
-        pendingError = nil
-        finishedSuccessURLs = []
-        outputA.startRecording(to: urlA, recordingDelegate: self)
-        outputB.startRecording(to: urlB, recordingDelegate: self)
+        let urls = ["A", "B"].map { dir.appendingPathComponent("DCS_\(id)_\($0).mp4") }
+        active = Context(outputs: [outputA, outputB], urls: urls,
+                         finished: onFinished, failed: onError)
+        finishLock.unlock()
+        outputA.startRecording(to: urls[0], recordingDelegate: self)
+        outputB.startRecording(to: urls[1], recordingDelegate: self)
     }
-
     func stop() {
-        outputA?.stopRecording()
-        outputB?.stopRecording()
+        finishLock.lock()
+        let outputs = active?.outputs ?? []
+        finishLock.unlock()
+        outputs.forEach { $0.stopRecording() }
     }
-
-    // MARK: - AVCaptureFileOutputRecordingDelegate
-
+    /// 等待真实完成回调，成功文件仍交付保存；不超时复用未知状态输出。
+    func abort(error: Error) {
+        finishLock.lock()
+        if active?.error == nil { active?.error = error }
+        let outputs = active?.outputs ?? []
+        finishLock.unlock()
+        outputs.forEach { $0.stopRecording() }
+    }
+    static func recordingSucceeded(error: Error?) -> Bool {
+        guard let error else { return true }
+        return ((error as NSError).userInfo[AVErrorRecordingSuccessfullyFinishedKey] as? NSNumber)?.boolValue == true
+    }
     func fileOutput(_ output: AVCaptureFileOutput,
                     didFinishRecordingTo outputFileURL: URL,
-                    from connections: [AVCaptureConnection],
-                    error: Error?) {
-        // 两路完成回调可能并发：先入队计数，回到主线程后再统一回调一次。
-        // 注意：**锁内绝不调用 stopRecording**——若系统在极少数情况下同步
-        // 派发完成事件，会重入同一个 finishLock 造成死锁。
-        // 先记录"需要停止的另一路"，解锁后再 stop。
-        var otherToStop: AVCaptureMovieFileOutput?
+                    from connections: [AVCaptureConnection], error: Error?) {
         finishLock.lock()
-        if let error, pendingError == nil {
-            pendingError = error
-            // 任一路启动/录制失败：立即停止另一路（若仍在录制），
-            // 成功完成的一段仍会走保存逻辑（onError 携带 successURLs）
-            otherToStop = (output === outputA) ? outputB : outputA
-        } else if error == nil {
-            finishedSuccessURLs.append(outputFileURL)
+        guard let context = active,
+              let index = context.outputs.firstIndex(where: { $0 === output }),
+              context.urls[index] == outputFileURL,
+              context.completed.insert(index).inserted else {
+            finishLock.unlock()
+            return
         }
-        finishedCount += 1
-        let allDone = finishedCount >= 2
-        let err = pendingError
-        let successURLs = finishedSuccessURLs
+        var otherToStop: AVCaptureMovieFileOutput?
+        if Self.recordingSucceeded(error: error) {
+            context.successful.insert(index)
+        } else {
+            if context.error == nil { context.error = error }
+            otherToStop = context.outputs[1 - index]
+        }
+        let allDone = context.completed.count == 2
+        let successURLs = context.urls.enumerated().compactMap {
+            context.successful.contains($0.offset) ? $0.element : nil
+        }
+        let failedURLs = context.urls.filter { !successURLs.contains($0) }
+        let resultError = context.error
+        if allDone { active = nil }
         finishLock.unlock()
-
+        // 锁外调用，避免 AVFoundation 同步重入。
         otherToStop?.stopRecording()
         guard allDone else { return }
         DispatchQueue.main.async {
-            if let err {
-                // 失败文件 = 本次录制的两个文件 − 成功文件（URL 值类型可直接比较）
-                let failedURLs = self.currentURLs.filter { !successURLs.contains($0) }
-                self.onError?(err, successURLs, failedURLs)
+            if let resultError {
+                context.failed?(resultError, successURLs, failedURLs)
             } else {
-                self.onFinished?(self.currentURLs)
+                context.finished?(successURLs)
             }
         }
     }

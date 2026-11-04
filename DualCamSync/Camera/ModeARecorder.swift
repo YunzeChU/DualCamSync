@@ -18,16 +18,34 @@ import VideoToolbox // 杜比视界 HDR 压缩属性（HDRMetadataInsertionMode 
 ///
 /// 声道策略：音轨在**音频首帧**按真实采集格式懒创建
 ///   （设备支持立体声则写入双声道 AAC；否则按实际声道写入，保证不失配不静音），
-///   并通过 startSessionIfNeeded 的"等待音频就绪"保证建轨先于 startWriting。
+///   写入队列先接收音轨格式与视频配对，随后确定同一真实时间线的起点。
 final class ModeARecorder: NSObject,
     AVCaptureVideoDataOutputSampleBufferDelegate,
     AVCaptureAudioDataOutputSampleBufferDelegate {
 
-    // MARK: - 队列（每路独立串行队列，保证帧序）
+    // MARK: - 单一媒体执行域（采集代理、合成、写入和收尾均串行）
 
-    let videoQueueA = DispatchQueue(label: "com.dualcamsync.videoA")
-    let videoQueueB = DispatchQueue(label: "com.dualcamsync.videoB")
-    let audioQueue  = DispatchQueue(label: "com.dualcamsync.audio")
+    private let mediaQueue = DispatchQueue(label: "com.dualcamsync.media")
+    var videoQueueA: DispatchQueue { mediaQueue }
+    var videoQueueB: DispatchQueue { mediaQueue }
+    var audioQueue: DispatchQueue { mediaQueue }
+    private var generation = UUID()
+    private var finishing = false
+    private var finishWritingStarted = false
+    private var accepting = false
+    private var retryScheduled = false
+    private var stopDeadline: CFTimeInterval?
+    private typealias Frame = (buffer: CVPixelBuffer, pts: CMTime)
+    private var framesA: [Frame] = []
+    private var framesB: [Frame] = []
+    private var audioSamples: [CMSampleBuffer] = []
+    private var pairs: [(a: Frame, b: Frame)] = []
+    private var lastVideoPTS: CMTime?
+    private var lastAudioPTS: CMTime?
+    private var unmatchedCount = 0
+    private var backpressureCount = 0
+    private var startupSkipped = 0
+    private var pendingFailure: Error?
 
     // MARK: - 会话输出引用（由 CameraManager 注入）
 
@@ -57,10 +75,11 @@ final class ModeARecorder: NSObject,
 
     // MARK: - 录制状态
 
-    private(set) var isRecording = false
+    private var isRecording = false
     private var outputSize: (width: Int32, height: Int32) = (1920, 1080)
     private var recordingLayout: PreviewLayout = .split
     private var recordingLandscape = true
+    private var recordingHDR = false
     /// 录制开始时的画中画小窗位置（归一化，y 从顶部算；由 CameraManager
     /// 在 start 时传入，合成帧时传给 VideoCompositor.makePiP —— 保证
     /// "成片小窗位置 = 录制开始时的预览位置"）
@@ -68,42 +87,18 @@ final class ModeARecorder: NSObject,
     /// 录制开始时的画中画小窗圆角比例（成片圆角 = 小窗宽 × 比例，
     /// 由 CameraManager 在 start 时传入；0 = 不加圆角）
     private var recordingPipCornerRadiusRatio: CGFloat = 0
-    /// 写入会话起点（多队列并发，需加锁保护）
-    private let startLock = NSLock()
     private var sessionStartTime: CMTime?
     private var isWriting = false
-
-    /// 帧配对缓冲（两路帧到齐后再合成，防止错位）
-    private let pairingLock = NSLock()
-    private var pendingA: (buffer: CVPixelBuffer, pts: CMTime)?
-    private var pendingB: (buffer: CVPixelBuffer, pts: CMTime)?
-
-    /// B 路滑动历史（最近 N 帧）：停止排空期给"时间戳落后于实时 pendingB"
-    /// 的积压 A 帧兜底配对。内存约束：4K BGRA 帧约 33MB，窗口只留 6 帧
-    /// （0.2s），配合"积压自适应降级"（连续配对失败即关圆角）保证积压
-    /// 不超过该窗口。录制结束即清空，释放对相机缓冲池的引用。
-    private var bHistory: [(buffer: CVPixelBuffer, pts: CMTime)] = []
-    private let bHistoryLimit = 6
-
-    /// 停止排空标志（主线程写、A 队列读，经 pairingLock 保护）：
-    /// 为 true 时配对失败改用 B 滑动历史兜底，把末尾帧写进文件。
-    private var draining = false
-
-    /// 积压自适应降级：A 路连续配对失败达到阈值（合成跟不上生产、队列
-    /// 积压）时置位，成片小窗临时不加圆角——合成开销回落到与
-    /// "9月无圆角版本"同等水平，消除积压源头。录制内不复位（防抖动）。
-    private var consecutivePairFailures = 0
-    private var performanceDegraded = false
-
-    /// 启动协调：视频首帧就绪后，最多等待音频首帧 audioStartTimeout 秒
-    /// （为按"音频真实声道数"懒创建音轨；超时则放弃音轨直接开写）。
-    private var videoReady = false
     private var audioReady = false
     private var videoFirstArrival: CFTimeInterval?
+    // Startup is bounded both by wall time and retained real-frame count.
     private let audioStartTimeout: CFTimeInterval = 0.5
 
     var onFinished: (([URL]) -> Void)?
     var onError: ((Error) -> Void)?
+    var onStarted: (() -> Void)?
+    /// A valid partial file is still saved when capture stops because of an error.
+    var onPartialFinished: ((URL, Error) -> Void)?
 
     // MARK: - 挂载/卸载
 
@@ -112,20 +107,24 @@ final class ModeARecorder: NSObject,
                 audioOutput: AVCaptureAudioDataOutput,
                 connA: AVCaptureConnection?,
                 connB: AVCaptureConnection?) {
+        mediaQueue.sync {
         self.videoOutputA = videoOutputA
         self.videoOutputB = videoOutputB
         self.audioOutput = audioOutput
         self.videoConnA = connA
         self.videoConnB = connB
         didVerifyHDRPipeline = false
+        }
     }
 
     func detach() {
+        mediaQueue.sync {
         videoOutputA = nil
         videoOutputB = nil
         audioOutput = nil
         videoConnA = nil
         videoConnB = nil
+        }
     }
 
     // MARK: - 录制控制
@@ -148,17 +147,13 @@ final class ModeARecorder: NSObject,
                pipPosition: CGPoint,
                pipCornerRadiusRatio: CGFloat,
                hdr: Bool) throws {
-        guard !isRecording else {
+        try mediaQueue.sync {
+        guard !isRecording, !finishing else {
             // 静默返回 = 录制键点了毫无反应；必须抛错让上层弹窗说明
             throw CameraError.recordingFailed("上一段视频仍在收尾，请稍候")
         }
-        guard manager != nil else {
-            throw CameraError.configurationFailed("录制器未就绪")
-        }
-
         let dir = FileManager.default.temporaryDirectory
-        let stamp = Int(Date().timeIntervalSince1970 * 1000)
-        let url = dir.appendingPathComponent("DCS_\(stamp)_composite.mp4")
+        let url = dir.appendingPathComponent("DCS_\(UUID().uuidString)_composite.mp4")
 
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
 
@@ -176,7 +171,7 @@ final class ModeARecorder: NSObject,
                 // （AVFoundation 头文件注释原文），AVVideoProfileLevelKey 直接接受该值
                 AVVideoProfileLevelKey: kVTProfileLevel_HEVC_Main10_AutoLevel,
                 kVTCompressionPropertyKey_HDRMetadataInsertionMode as String: kVTHDRMetadataInsertionMode_Auto,
-                kVTCompressionPropertyKey_PreserveDynamicHDRMetadata as String: true,
+                kVTCompressionPropertyKey_PreserveDynamicHDRMetadata as String: false,
             ]
             videoSettings = [
                 AVVideoCodecKey: AVVideoCodecType.hevc,
@@ -231,7 +226,7 @@ final class ModeARecorder: NSObject,
         // （multichannelAudioMode 生效后，实际声道可能与 activeFormat 不同；
         // 固定 2 声道后丢弃非双声道样本会导致整段静音）。改为音频首帧
         // 回调按真实 ASBD 懒创建，仍在 startWriting 之前完成——
-        // 由 startSessionIfNeeded 的"等待音频就绪"协调保证。
+        // 由 pump 的启动协调保证。
         self.writer = writer
         self.videoWriterInput = videoInput
         self.pixelAdaptor = adaptor
@@ -239,326 +234,278 @@ final class ModeARecorder: NSObject,
         self.outputSize = outputSize
         self.recordingLayout = layout
         self.recordingLandscape = outputSize.width > outputSize.height
+        self.recordingHDR = hdr
         self.recordingPipPosition = pipPosition
         self.recordingPipCornerRadiusRatio = pipCornerRadiusRatio
         self.sessionStartTime = nil
         self.isWriting = false
         self.audioWriterInput = nil
-        self.pendingA = nil
-        self.pendingB = nil
-        self.bHistory.removeAll(keepingCapacity: false)
-        self.draining = false
-        self.consecutivePairFailures = 0
-        self.performanceDegraded = false
-        self.videoReady = false
         self.audioReady = (audioFormat == nil)   // 无麦克风 → 无需等待音频
         self.videoFirstArrival = nil
         self.isRecording = true
+        self.accepting = true
+        self.generation = UUID()
+        self.framesA = []; self.framesB = []; self.pairs = []; self.audioSamples = []
+        self.lastVideoPTS = nil; self.lastAudioPTS = nil
+        self.unmatchedCount = 0; self.backpressureCount = 0
+        self.startupSkipped = 0
+        self.stopDeadline = nil
+        self.finishWritingStarted = false
+        self.retryScheduled = false
+        self.pendingFailure = nil
+        }
     }
 
-    /// 停止录制：先排空已入队样本（期间 isRecording 仍为 true），再收尾
-    /// -------------------------------------------------------------
-    /// 修复"结尾定格/最后几秒拍不到"（真机实测：合成/写入慢时 A 路视频
-    /// 队列与音频队列会积压已入队的回调样本；若直接置 isRecording=false，
-    /// 这些样本执行时被丢弃 → 视频末尾整段缺失）。
-    ///
-    /// 停止时序（由 CameraManager.stopRecording 先断开 A/B/音频输出连接）：
-    ///   1. 置 draining=true：videoQueueA.sync 排空 A 路积压帧。积压帧的
-    ///      时间戳落后于实时，正常配对必然失败，改用 B 路滑动历史
-    ///      兜底配对写入（见 handleVideoSampleBuffer/nearestB）；
-    ///   2. audioQueue.sync 排空音频（与视频末尾时间对齐）；
-    ///   3. draining=false、isRecording=false，markAsFinished + finishWriting。
-    /// 队列任务不依赖主线程，主线程 sync 等待无死锁；连接已断流，
-    /// 排空期间无新样本入队，队列有界。
-    func stop() {
-        guard isRecording else { return }
-        pairingLock.lock()
-        draining = true
-        pairingLock.unlock()
-        videoQueueA.sync { }
-        audioQueue.sync { }
-        pairingLock.lock()
-        draining = false
-        pairingLock.unlock()
-        isRecording = false
 
-        // 没有任何帧写入（例如刚点录制立刻停止）：直接丢弃临时文件
-        guard let writer, isWriting else {
-            if let url = outputURL {
-                try? FileManager.default.removeItem(at: url)
-            }
-            resetWriterState()
-            DispatchQueue.main.async { [weak self] in
-                self?.onFinished?([])
-            }
+    // Sample delivery and writer state share mediaQueue. Manager disables source connections
+    // before stop; the queued stop marker follows samples already delivered on this queue.
+    func stop() {
+        mediaQueue.async { [weak self] in
+            guard let self, self.isRecording, !self.finishing else { return }
+            self.accepting = false
+            self.finishing = true
+            self.stopDeadline = CACurrentMediaTime() + 3
+            self.pump()
+        }
+    }
+
+    func abort(error: Error) {
+        mediaQueue.async { [weak self] in self?.fail(error) }
+    }
+
+    private func clear() {
+        writer = nil; videoWriterInput = nil; audioWriterInput = nil
+        pixelAdaptor = nil; outputURL = nil; sessionStartTime = nil
+        isWriting = false
+        framesA = []; framesB = []; pairs = []; audioSamples = []
+    }
+
+    private func fail(_ error: Error) {
+        guard isRecording || finishing else { return }
+        if pendingFailure == nil { pendingFailure = error }
+        accepting = false
+        // A completed writer may be awaiting its queued completion callback.
+        // Preserve that callback and let it deliver the file with this error.
+        guard !finishWritingStarted else { return }
+        if let writer, writer.status == .writing, isWriting, lastVideoPTS != nil {
+            // The encoder may still finalize already accepted samples. Preserve those
+            // instead of cancelling a potentially useful recording on capture failure.
+            finishing = true
+            framesA.removeAll(); framesB.removeAll(); pairs.removeAll(); audioSamples.removeAll()
+            finishCurrent()
             return
         }
+        let callback = onError
+        let file = outputURL?.lastPathComponent ?? "unknown"
+        writer?.cancelWriting()
+        print("[ModeA] failure file=\(file) error=\(error.localizedDescription)")
+        accepting = false; isRecording = false; finishing = false
+        generation = UUID()
+        clear()
+        DispatchQueue.main.async { callback?(error) }
+    }
 
+    private func finishCurrent() {
+        guard finishing, !finishWritingStarted else { return }
+        finishWritingStarted = true
+        let current = generation
+        let completed = onFinished
+        let failed = onError
+        let partial = onPartialFinished
+        let url = outputURL
+        guard let writer, isWriting else {
+            self.writer?.cancelWriting()
+            if let url { try? FileManager.default.removeItem(at: url) }
+            isRecording = false; finishing = false
+            clear()
+            DispatchQueue.main.async { completed?([]) }
+            return
+        }
+        print("[ModeA] finish videoPTS=\(lastVideoPTS?.seconds ?? -1) audioPTS=\(lastAudioPTS?.seconds ?? -1) unmatched=\(unmatchedCount) backpressure=\(backpressureCount) startupSkipped=\(startupSkipped)")
         videoWriterInput?.markAsFinished()
         audioWriterInput?.markAsFinished()
         writer.finishWriting { [weak self] in
-            guard let self, let url = self.outputURL else { return }
-            let status = writer.status
-            DispatchQueue.main.async {
-                if status == .completed {
-                    self.onFinished?([url])
-                } else {
-                    // 失败文件保留在临时目录，提示带上路径便于用户找回
-                    self.onError?(CameraError.recordingFailed(
-                        "写入失败 (\(status.rawValue))；未保存文件位于临时目录：\(url.lastPathComponent)"))
+            guard let self else { return }
+            self.mediaQueue.async {
+                guard self.generation == current else { return }
+                let error = writer.error
+                let captureError = self.pendingFailure
+                let succeeded = writer.status == .completed && error == nil
+                self.isRecording = false; self.finishing = false
+                self.clear()
+                DispatchQueue.main.async {
+                    if succeeded, let url, let captureError { partial?(url, captureError) }
+                    else if succeeded, let url { completed?([url]) }
+                    else { failed?(CameraError.recordingFailed(error?.localizedDescription ?? "合成文件写入失败")) }
                 }
             }
-            self.resetWriterState()
         }
     }
 
-    /// 清空写入器引用（保留 isRecording=false 状态）
-    private func resetWriterState() {
-        writer = nil
-        videoWriterInput = nil
-        pixelAdaptor = nil
-        audioWriterInput = nil
-        outputURL = nil
-        sessionStartTime = nil
-        isWriting = false
-        // 释放 B 路滑动历史对相机缓冲池的引用（4K 帧约 33MB/帧）
-        bHistory.removeAll(keepingCapacity: false)
-    }
-
-    /// 估算码率：1080P 约 12Mbps，4K 约 35Mbps，保证画质与体积平衡
     private func estimateVideoBitrate(width: Int32, height: Int32) -> Int {
-        let pixels = Double(width) * Double(height)
-        if pixels >= 3840 * 2160 { return 35_000_000 }
-        if pixels >= 1920 * 1080 { return 12_000_000 }
-        return 8_000_000
+        Double(width) * Double(height) >= 3840 * 2160 ? 35_000_000 : 12_000_000
     }
 
-    // MARK: - 视频/音频回调
-
-    /// 视频与音频回调共用同一入口（两个协议的签名完全一致），按输出类型分流
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         if output is AVCaptureVideoDataOutput {
-            handleVideoSampleBuffer(sampleBuffer, connection: connection)
+            let isA = connection === videoConnA
+            guard isA || connection === videoConnB,
+                  let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            if isA && !didVerifyHDRPipeline {
+                didVerifyHDRPipeline = true
+                let format = CVPixelBufferGetPixelFormatType(buffer)
+                let tenBit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                    || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+                let callback = onHDRPipelineVerified
+                DispatchQueue.main.async { callback?(tenBit) }
+            }
+            guard accepting else { return }
+            let format = CVPixelBufferGetPixelFormatType(buffer)
+            let tenBit = format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+                || format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            guard tenBit == recordingHDR else {
+                fail(CameraError.recordingFailed("采集像素格式与写入设置不一致，已停止以避免错误成片"))
+                return
+            }
+            // Do not retain hundreds of MB while the microphone is warming up.
+            // Recording media begins only once its real audio format is known.
+            if !audioReady {
+                startupSkipped += 1
+                if videoFirstArrival == nil { videoFirstArrival = CACurrentMediaTime() }
+                if CACurrentMediaTime() - (videoFirstArrival ?? 0) >= audioStartTimeout {
+                    fail(CameraError.recordingFailed("麦克风启动超时，未开始录制"))
+                }
+                return
+            }
+            let frame = (buffer: buffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+            if isA { framesA.append(frame) } else { framesB.append(frame) }
+            guard framesA.count <= 6, framesB.count <= 6 else {
+                fail(CameraError.recordingFailed("两路采集持续不同步，已停止以避免尾部画面丢失")); return
+            }
         } else {
-            handleAudioSampleBuffer(sampleBuffer, connection: connection)
-        }
-    }
-
-    /// 视频回调：两路帧配对后合成一帧写入
-    /// -------------------------------------------------------------
-    /// 串行化设计（修复合成+写入并发）：
-    ///   - B 路（videoQueueB）：只更新配对缓冲 + 滑动历史，不做合成/写入；
-    ///   - A 路（videoQueueA）：独占"配对 → 清空缓冲 → 合成 → append"，
-    ///     保证 CIContext.render 与 AVAssetWriter append 永远只在单条
-    ///     串行队列上执行，不会并发。
-    ///   - 配对成功后立即清空 pendingA/B，防止旧帧被重复配对。
-    ///   - 配对失败分两种处理：
-    ///       * 正常录制中（!draining）：连续失败说明合成跟不上生产、
-    ///         A 队列积压（积压帧时间落后于实时 B，0.1s 窗口永远配不上），
-    ///         达到阈值后触发"积压自适应降级"——临时关闭成片小窗圆角，
-    ///         合成开销回到 9 月无圆角版本水平，从源头消除积压；
-    ///       * 停止排空期（draining）：用 B 路滑动历史里时间最近的帧
-    ///         兜底配对，把已积压的末尾帧救回文件（修"结尾定格"）。
-    private func handleVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer,
-                                        connection: AVCaptureConnection) {
-        let isA = (connection === videoConnA)
-        let isB = (connection === videoConnB)
-        // 一次性运行时校验（不依赖录制状态：采集一直在跑，首帧即上报）。
-        // 只在 A 队列执行——A/B 两路独立串行队列并发读写 didVerifyHDRPipeline
-        // 构成数据竞争（外部审核 P1-3）；两路像素格式相同，校验一路即代表会话。
-        if isA, !didVerifyHDRPipeline {
-            didVerifyHDRPipeline = true
-            if let pb = CMSampleBufferGetImageBuffer(sampleBuffer) {
-                let fmt = CVPixelBufferGetPixelFormatType(pb)
-                let is10Bit = fmt == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
-                    || fmt == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
-                DispatchQueue.main.async { [weak self] in
-                    self?.onHDRPipelineVerified?(is10Bit)
-                }
-            }
-        }
-        guard isRecording,
-              let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        guard isA || isB else { return }
-
-        // B 路：只写配对缓冲 + 滑动历史（加锁），让 A 路队列串行消费
-        if isB {
-            pairingLock.lock()
-            pendingB = (pixelBuffer, pts)
-            bHistory.append((pixelBuffer, pts))
-            if bHistory.count > bHistoryLimit {
-                bHistory.removeFirst(bHistory.count - bHistoryLimit)
-            }
-            pairingLock.unlock()
-            return
-        }
-
-        // A 路：配对成功后消费缓冲并合成写入
-        pairingLock.lock()
-        pendingA = (pixelBuffer, pts)
-        guard let a = pendingA, let b = pendingB,
-              abs(a.pts.seconds - b.pts.seconds) < 0.1 else {
-            let isDraining = draining
-            if isDraining {
-                // 停止排空：积压 A 帧用 B 滑动历史兜底配对（时间戳最接近
-                // 且窗口 0.1s 内），救回末尾帧；找不到则丢弃该帧。
-                // 注：guard let 的 a/b 在 else 分支内不可见，此处用局部
-                // 元组重建当前 A 帧（内容 = 刚写入 pendingA 的本帧）。
-                pairingLock.unlock()
-                let a = (buffer: pixelBuffer, pts: pts)
-                if let b = nearestB(to: a.pts),
-                   abs(a.pts.seconds - b.pts.seconds) < 0.1 {
-                    writeComposed(a: a, b: b)
-                }
-            } else {
-                // 正常录制中配对失败 = 合成/写入跟不上的积压信号
-                consecutivePairFailures += 1
-                if consecutivePairFailures >= 6, !performanceDegraded {
-                    performanceDegraded = true
-                }
-                pairingLock.unlock()
-            }
-            return
-        }
-        // 配对成功：消费缓冲，防止旧帧被重复配对
-        consecutivePairFailures = 0
-        pendingA = nil
-        pendingB = nil
-        pairingLock.unlock()
-        writeComposed(a: a, b: b)
-    }
-
-    /// 配对后统一走"标记就绪 → 启动会话 → 合成 → 写入"（A 路串行队列上）
-    private func writeComposed(a: (buffer: CVPixelBuffer, pts: CMTime),
-                               b: (buffer: CVPixelBuffer, pts: CMTime)) {
-        let frameTime = a.pts
-
-        // 标记视频就绪（供启动协调等待音频建轨；首帧时间记作等待起点）
-        startLock.lock()
-        videoReady = true
-        if videoFirstArrival == nil { videoFirstArrival = CACurrentMediaTime() }
-        startLock.unlock()
-
-        startSessionIfNeeded(at: frameTime)
-
-        // 积压自适应降级：合成跟不上时临时关圆角（仅本段录制生效）
-        let cornerRatio = performanceDegraded ? 0 : recordingPipCornerRadiusRatio
-        guard let composed = compositor.composite(frameA: a.buffer,
-                                                  frameB: b.buffer,
-                                                  layout: recordingLayout,
-                                                  landscape: recordingLandscape,
-                                                  pipPosition: recordingPipPosition,
-                                                  pipCornerRadiusRatio: cornerRatio,
-                                                  outputWidth: outputSize.width,
-                                                  outputHeight: outputSize.height),
-              let adaptor = pixelAdaptor,
-              adaptor.assetWriterInput.isReadyForMoreMediaData else { return }
-        adaptor.append(composed, withPresentationTime: frameTime)
-    }
-
-    /// 从 B 路滑动历史里找时间戳最接近的帧（停止排空期兜底配对用）
-    private func nearestB(to pts: CMTime) -> (buffer: CVPixelBuffer, pts: CMTime)? {
-        var best: (buffer: CVPixelBuffer, pts: CMTime)?
-        var bestDiff = Double.greatestFiniteMagnitude
-        for entry in bHistory {
-            let diff = abs(entry.pts.seconds - pts.seconds)
-            if diff < bestDiff {
-                bestDiff = diff
-                best = entry
-            }
-        }
-        return best
-    }
-
-    /// 音频回调：按真实声道数懒创建 AAC 音轨并写入
-    /// 注意：AVCaptureConnection 没有 mediaType，需经 inputPorts 判断
-    private func handleAudioSampleBuffer(_ sampleBuffer: CMSampleBuffer,
-                                        connection: AVCaptureConnection) {
-        guard isRecording, connection.inputPorts.first?.mediaType == .audio else { return }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-
-        // 音轨懒创建：按"真实采集到的音频样本"格式创建 AAC 输入
-        // （声道=实际采集：立体声模式生效写双声道，否则写单声道，保证不静音）。
-        // 必须在 startWriting 之前完成；若写入已开始（isWriting），
-        // AVAssetWriter 不允许再添加输入，放弃音频只保留视频。
-        if audioWriterInput == nil {
-            startLock.lock()
-            if !isWriting,
-               let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
-               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc),
+            guard accepting else { return }
+            if !audioReady, !isWriting,
+               let description = CMSampleBufferGetFormatDescription(sampleBuffer),
+               let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(description),
                let writer {
-                let channels = Int(asbd.pointee.mChannelsPerFrame)
-                let sampleRate = asbd.pointee.mSampleRate
                 let settings: [String: Any] = [
                     AVFormatIDKey: kAudioFormatMPEG4AAC,
-                    AVSampleRateKey: sampleRate,
-                    AVNumberOfChannelsKey: channels,
-                    AVEncoderBitRateKey: 128_000,
+                    AVSampleRateKey: asbd.pointee.mSampleRate,
+                    AVNumberOfChannelsKey: Int(asbd.pointee.mChannelsPerFrame),
+                    AVEncoderBitRateKey: 128_000
                 ]
                 let input = AVAssetWriterInput(mediaType: .audio, outputSettings: settings)
                 input.expectsMediaDataInRealTime = true
-                if writer.canAdd(input) {
-                    writer.add(input)
-                    audioWriterInput = input
+                guard writer.canAdd(input) else {
+                    fail(CameraError.recordingFailed("无法添加合成音轨")); return
                 }
+                writer.add(input); audioWriterInput = input; audioReady = true
             }
-            // 无论建轨成败，音频都视为"settled"，不再阻塞写入启动
-            audioReady = true
-            startLock.unlock()
+            if audioWriterInput != nil { audioSamples.append(sampleBuffer) }
         }
-
-        startSessionIfNeeded(at: pts)
-
-        // 保证样本时间不早于会话起点（防止写入器拒绝）
-        var outputPTS = pts
-        var copied: CMSampleBuffer?
-        if let start = sessionStartTime, pts < start {
-            outputPTS = start
-            var timing = CMSampleTimingInfo(duration: CMSampleBufferGetDuration(sampleBuffer),
-                                            presentationTimeStamp: outputPTS,
-                                            decodeTimeStamp: .invalid)
-            CMSampleBufferCreateCopyWithNewTiming(allocator: kCFAllocatorDefault,
-                                                  sampleBuffer: sampleBuffer,
-                                                  sampleTimingEntryCount: 1,
-                                                  sampleTimingArray: &timing,
-                                                  sampleBufferOut: &copied)
-        }
-        let buffer = copied ?? sampleBuffer
-        guard let audioWriterInput, audioWriterInput.isReadyForMoreMediaData else { return }
-        audioWriterInput.append(buffer)
+        pump()
     }
 
-    /// 以首个样本时间作为会话起点（先到先定，后续样本时间必然 ≥ 起点）
-    /// 注意：视频A/视频B/音频三条队列并发调用，必须加锁保证只启动一次。
-    ///
-    /// 启动协调（修复"固定2声道丢弃非双声道导致整段静音"）：
-    /// 音轨按音频首帧真实声道数懒创建，因此 startWriting 需要等待——
-    ///   videoReady（视频首帧已配对） && ( audioReady（音轨已建 / 无麦克风）
-    ///   || 等待音频超时 0.5s ) 才真正开写，
-    /// 保证音轨创建始终在 startWriting 之前（AVAssetWriter 约束）。
-    private func startSessionIfNeeded(at time: CMTime) {
-        startLock.lock()
-        defer { startLock.unlock() }
-        guard !isWriting, let writer else { return }
-        let audioSettled = audioReady
-            || (videoFirstArrival != nil
-                && CACurrentMediaTime() - (videoFirstArrival ?? 0) > audioStartTimeout)
-        guard videoReady && audioSettled else { return }
-        isWriting = true
-        sessionStartTime = time
-        writer.startWriting()
-        writer.startSession(atSourceTime: time)
+    private func schedulePump() {
+        guard !retryScheduled else { return }
+        retryScheduled = true
+        let current = generation
+        mediaQueue.asyncAfter(deadline: .now() + 0.01) { [weak self] in
+            guard let self else { return }
+            guard self.generation == current else { return }
+            self.retryScheduled = false
+            self.pump()
+        }
     }
 
-    // MARK: - 丢帧统计（仅日志，不阻塞）
+    /// A and B arrivals both complete pairs; retain real frames during writer backpressure.
+    enum PairDecision: Equatable { case pair, discardA, discardB }
+    static func pairingDecision(a: Double, b: Double) -> PairDecision {
+        if abs(a - b) < 0.1 { return .pair }
+        return a < b ? .discardA : .discardB
+    }
 
-    func captureOutput(_ output: AVCaptureOutput,
-                       didDrop sampleBuffer: CMSampleBuffer,
-                       from connection: AVCaptureConnection) {
-        // 高负载时系统会主动丢帧（alwaysDiscardsLateVideoFrames=true），
-        // 此处保留埋点位，便于后续排查性能问题。
+    private func pump() {
+        guard isRecording, !finishWritingStarted else { return }
+        while let a = framesA.first, let b = framesB.first {
+            let decision = Self.pairingDecision(a: a.pts.seconds, b: b.pts.seconds)
+            if decision == .pair {
+                pairs.append((a, b)); framesA.removeFirst(); framesB.removeFirst()
+            } else {
+                unmatchedCount += 1
+                if decision == .discardA { framesA.removeFirst() } else { framesB.removeFirst() }
+            }
+        }
+        guard pairs.count <= 6, audioSamples.count <= 100 else {
+            fail(CameraError.recordingFailed("合成写入持续过慢，已停止；请降低规格后重试")); return
+        }
+        if !isWriting, let first = pairs.first {
+            if videoFirstArrival == nil { videoFirstArrival = CACurrentMediaTime() }
+            if !audioReady && CACurrentMediaTime() - (videoFirstArrival ?? 0) >= audioStartTimeout {
+                fail(CameraError.recordingFailed("未收到麦克风样本，已停止以避免无声音或时间线错位")); return
+            }
+            if audioReady, let writer {
+                // Audio may precede the first admitted pair. Keep only its nearby
+                // startup samples; never anchor video to seconds-old microphone PTS.
+                audioSamples.removeAll {
+                    CMSampleBufferGetPresentationTimeStamp($0).seconds < first.a.pts.seconds - 0.1
+                }
+                let audioPTS = audioSamples.first.map { CMSampleBufferGetPresentationTimeStamp($0) }
+                let start = audioPTS.map { CMTimeMinimum(first.a.pts, $0) } ?? first.a.pts
+                guard writer.startWriting() else {
+                    fail(writer.error ?? CameraError.recordingFailed("视频写入器启动失败")); return
+                }
+                writer.startSession(atSourceTime: start)
+                sessionStartTime = start; isWriting = true
+                let started = onStarted
+                DispatchQueue.main.async { started?() }
+            } else { schedulePump(); return }
+        }
+        if isWriting {
+            while let pair = pairs.first {
+                guard let input = videoWriterInput, input.isReadyForMoreMediaData else {
+                    backpressureCount += 1; schedulePump(); break
+                }
+                guard let composed = compositor.composite(
+                    frameA: pair.a.buffer, frameB: pair.b.buffer,
+                    layout: recordingLayout, landscape: recordingLandscape,
+                    pipPosition: recordingPipPosition,
+                    pipCornerRadiusRatio: recordingPipCornerRadiusRatio,
+                    outputWidth: outputSize.width, outputHeight: outputSize.height),
+                    let adaptor = pixelAdaptor,
+                    adaptor.append(composed, withPresentationTime: pair.a.pts) else {
+                    fail(writer?.error ?? CameraError.recordingFailed("合成视频帧写入失败")); return
+                }
+                lastVideoPTS = pair.a.pts; pairs.removeFirst()
+            }
+            while let sample = audioSamples.first {
+                guard let input = audioWriterInput else { audioSamples.removeAll(); break }
+                guard input.isReadyForMoreMediaData else { schedulePump(); break }
+                guard input.append(sample) else {
+                    fail(writer?.error ?? CameraError.recordingFailed("音频写入失败")); return
+                }
+                lastAudioPTS = CMSampleBufferGetPresentationTimeStamp(sample)
+                audioSamples.removeFirst()
+            }
+        }
+        if finishing {
+            if !isWriting && pairs.isEmpty {
+                audioSamples.removeAll()
+                finishCurrent()
+                return
+            }
+            if pairs.isEmpty && audioSamples.isEmpty {
+                unmatchedCount += framesA.count + framesB.count
+                print("[ModeA] terminalUnpairedA=\(framesA.count) terminalUnpairedB=\(framesB.count)")
+                // Source connections stop independently; a few unmatched callbacks must
+                // not discard an otherwise valid recording. Counts remain diagnostic.
+                framesA.removeAll(); framesB.removeAll()
+                finishCurrent()
+            } else if CACurrentMediaTime() >= (stopDeadline ?? .greatestFiniteMagnitude) {
+                fail(CameraError.recordingFailed("停止后编码器未能排空，本段未保存"))
+            } else { schedulePump() }
+        }
     }
 }
