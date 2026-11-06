@@ -90,4 +90,9 @@ final class ModeARecorderTests: XCTestCase {
         XCTAssertTrue(diagnostic.contains("BGRA"))
         XCTAssertTrue(diagnostic.contains("0x"))
     }
+
+    func testDroppedFrameReasonUsesSystemReasonOrClearUnknownFallback() {
+        XCTAssertEqual(ModeARecorder.droppedFrameReasonDescription("lateFrame"), "lateFrame")
+        XCTAssertEqual(ModeARecorder.droppedFrameReasonDescription(nil), "unknown")
+    }
 }

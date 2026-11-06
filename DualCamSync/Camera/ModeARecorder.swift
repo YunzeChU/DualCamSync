@@ -53,6 +53,30 @@ final class ModeARecorder: NSObject,
     private var pendingFailure: Error?
     private let inputQuiescenceDelay: DispatchTimeInterval = .milliseconds(150)
 
+    // MARK: - Per-recording tail diagnostics
+
+    private enum CaptureStream { case videoA, videoB, audio }
+
+    private struct StreamTelemetry {
+        var receivedCount = 0
+        var pairedCount = 0
+        var writtenCount = 0
+        var lastReceivedPTS: CMTime?
+        var lastPairedPTS: CMTime?
+        var lastWrittenPTS: CMTime?
+        var dropReasons: [String: Int] = [:]
+    }
+
+    private var telemetryA = StreamTelemetry()
+    private var telemetryB = StreamTelemetry()
+    private var telemetryAudio = StreamTelemetry()
+    private var discardedA = 0
+    private var discardedB = 0
+    private var videoWriterNotReadyCount = 0
+    private var audioWriterNotReadyCount = 0
+    private var stopRequestedAt: CFTimeInterval?
+    private var inputSealedAt: CFTimeInterval?
+
     // MARK: - 会话输出引用（由 CameraManager 注入）
 
     private weak var videoOutputA: AVCaptureVideoDataOutput?
@@ -290,6 +314,11 @@ final class ModeARecorder: NSObject,
         self.lastVideoPTS = nil; self.lastAudioPTS = nil
         self.unmatchedCount = 0; self.backpressureCount = 0
         self.startupSkipped = 0
+        self.telemetryA = StreamTelemetry(); self.telemetryB = StreamTelemetry()
+        self.telemetryAudio = StreamTelemetry()
+        self.discardedA = 0; self.discardedB = 0
+        self.videoWriterNotReadyCount = 0; self.audioWriterNotReadyCount = 0
+        self.stopRequestedAt = nil; self.inputSealedAt = nil
         self.stopDeadline = nil
         self.awaitingInputQuiescence = false
         self.finishWritingStarted = false
@@ -308,6 +337,7 @@ final class ModeARecorder: NSObject,
             guard let self, self.isRecording, !self.finishing else { return }
             self.finishing = true
             self.awaitingInputQuiescence = true
+            self.stopRequestedAt = CACurrentMediaTime()
             self.stopDeadline = CACurrentMediaTime() + 3
             self.pump()
             let current = self.generation
@@ -315,6 +345,7 @@ final class ModeARecorder: NSObject,
                 guard let self, self.generation == current, self.finishing else { return }
                 self.awaitingInputQuiescence = false
                 self.accepting = false
+                self.inputSealedAt = CACurrentMediaTime()
                 self.pump()
             }
         }
@@ -331,10 +362,61 @@ final class ModeARecorder: NSObject,
         framesA = []; framesB = []; pairs = []; audioSamples = []
     }
 
+    private func recordReceived(_ stream: CaptureStream, pts: CMTime) {
+        switch stream {
+        case .videoA:
+            telemetryA.receivedCount += 1; telemetryA.lastReceivedPTS = pts
+        case .videoB:
+            telemetryB.receivedCount += 1; telemetryB.lastReceivedPTS = pts
+        case .audio:
+            telemetryAudio.receivedCount += 1; telemetryAudio.lastReceivedPTS = pts
+        }
+    }
+
+    private func recordDropped(_ stream: CaptureStream, reason: String) {
+        switch stream {
+        case .videoA: telemetryA.dropReasons[reason, default: 0] += 1
+        case .videoB: telemetryB.dropReasons[reason, default: 0] += 1
+        case .audio: break
+        }
+    }
+
+    static func droppedFrameReasonDescription(_ value: Any?) -> String {
+        guard let value else { return "unknown" }
+        let description = String(describing: value)
+        return description.isEmpty ? "unknown" : description
+    }
+
+    private static func seconds(_ time: CMTime?) -> String {
+        guard let time, time.isValid else { return "none" }
+        return String(format: "%.3f", time.seconds)
+    }
+
+    private func telemetryDescription(_ telemetry: StreamTelemetry) -> String {
+        let reasons = telemetry.dropReasons.keys.sorted().map {
+            "\($0):\(telemetry.dropReasons[$0] ?? 0)"
+        }.joined(separator: ",")
+        return "received=\(telemetry.receivedCount),lastReceived=\(Self.seconds(telemetry.lastReceivedPTS)),paired=\(telemetry.pairedCount),lastPaired=\(Self.seconds(telemetry.lastPairedPTS)),written=\(telemetry.writtenCount),lastWritten=\(Self.seconds(telemetry.lastWrittenPTS)),drops={\(reasons)}"
+    }
+
+    private func logTailSummary(event: String, writerStatus: AVAssetWriter.Status? = nil,
+                                writerError: Error? = nil) {
+        let stopToSeal: String
+        if let stopRequestedAt, let inputSealedAt {
+            stopToSeal = String(format: "%.3f", inputSealedAt - stopRequestedAt)
+        } else {
+            stopToSeal = "none"
+        }
+        let status = writerStatus.map { String(describing: $0) } ?? "none"
+        let error = writerError?.localizedDescription ?? "none"
+        print("[ModeA][TailSummary] event=\(event) stopToSeal=\(stopToSeal) writerStatus=\(status) writerError=\(error) A{\(telemetryDescription(telemetryA))} B{\(telemetryDescription(telemetryB))} audio{\(telemetryDescription(telemetryAudio))} discardedA=\(discardedA) discardedB=\(discardedB) writerNotReady(video=\(videoWriterNotReadyCount),audio=\(audioWriterNotReadyCount)) unmatched=\(unmatchedCount) startupSkipped=\(startupSkipped)")
+    }
+
     private func fail(_ error: Error) {
         guard isRecording || finishing else { return }
         if pendingFailure == nil { pendingFailure = error }
         accepting = false
+        logTailSummary(event: "failure", writerStatus: writer?.status, writerError: error)
         // A completed writer may be awaiting its queued completion callback.
         // Preserve that callback and let it deliver the file with this error.
         guard !finishWritingStarted else { return }
@@ -365,6 +447,8 @@ final class ModeARecorder: NSObject,
         let partial = onPartialFinished
         let url = outputURL
         guard let writer, isWriting else {
+            logTailSummary(event: "finish-empty", writerStatus: writer?.status,
+                           writerError: writer?.error)
             self.writer?.cancelWriting()
             if let url { try? FileManager.default.removeItem(at: url) }
             isRecording = false; finishing = false
@@ -372,7 +456,8 @@ final class ModeARecorder: NSObject,
             DispatchQueue.main.async { completed?([]) }
             return
         }
-        print("[ModeA] finish videoPTS=\(lastVideoPTS?.seconds ?? -1) audioPTS=\(lastAudioPTS?.seconds ?? -1) unmatched=\(unmatchedCount) backpressure=\(backpressureCount) startupSkipped=\(startupSkipped)")
+        logTailSummary(event: "finish-request", writerStatus: writer.status,
+                       writerError: writer.error)
         videoWriterInput?.markAsFinished()
         audioWriterInput?.markAsFinished()
         writer.finishWriting { [weak self] in
@@ -382,6 +467,8 @@ final class ModeARecorder: NSObject,
                 let error = writer.error
                 let captureError = self.pendingFailure
                 let succeeded = writer.status == .completed && error == nil
+                self.logTailSummary(event: "finish-complete", writerStatus: writer.status,
+                                    writerError: error)
                 self.isRecording = false; self.finishing = false
                 self.clear()
                 DispatchQueue.main.async {
@@ -404,6 +491,9 @@ final class ModeARecorder: NSObject,
             let isA = connection === videoConnA
             guard isA || connection === videoConnB,
                   let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+            let stream: CaptureStream = isA ? .videoA : .videoB
+            let samplePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            recordReceived(stream, pts: samplePTS)
             if isA && !didVerifyHDRPipeline {
                 didVerifyHDRPipeline = true
                 let format = CVPixelBufferGetPixelFormatType(buffer)
@@ -446,12 +536,14 @@ final class ModeARecorder: NSObject,
                 }
                 return
             }
-            let frame = (buffer: buffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+            let frame = (buffer: buffer, pts: samplePTS)
             if isA { framesA.append(frame) } else { framesB.append(frame) }
             guard framesA.count <= 6, framesB.count <= 6 else {
                 fail(CameraError.recordingFailed("两路采集持续不同步，已停止以避免尾部画面丢失")); return
             }
         } else {
+            let samplePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            recordReceived(.audio, pts: samplePTS)
             guard accepting else { return }
             if !audioReady, !isWriting,
                let description = CMSampleBufferGetFormatDescription(sampleBuffer),
@@ -473,6 +565,19 @@ final class ModeARecorder: NSObject,
             if audioWriterInput != nil { audioSamples.append(sampleBuffer) }
         }
         pump()
+    }
+
+    func captureOutput(_ output: AVCaptureOutput,
+                       didDrop sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard output is AVCaptureVideoDataOutput else { return }
+        let isA = connection === videoConnA
+        guard isA || connection === videoConnB else { return }
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(
+            sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
+        let reason = Self.droppedFrameReasonDescription(
+            attachments?.first?[kCMSampleBufferAttachmentKey_DroppedFrameReason])
+        recordDropped(isA ? .videoA : .videoB, reason: reason)
     }
 
     private func schedulePump() {
@@ -500,9 +605,15 @@ final class ModeARecorder: NSObject,
             let decision = Self.pairingDecision(a: a.pts.seconds, b: b.pts.seconds)
             if decision == .pair {
                 pairs.append((a, b)); framesA.removeFirst(); framesB.removeFirst()
+                telemetryA.pairedCount += 1; telemetryA.lastPairedPTS = a.pts
+                telemetryB.pairedCount += 1; telemetryB.lastPairedPTS = b.pts
             } else {
                 unmatchedCount += 1
-                if decision == .discardA { framesA.removeFirst() } else { framesB.removeFirst() }
+                if decision == .discardA {
+                    discardedA += 1; framesA.removeFirst()
+                } else {
+                    discardedB += 1; framesB.removeFirst()
+                }
             }
         }
         guard pairs.count <= 6, audioSamples.count <= 100 else {
@@ -533,7 +644,7 @@ final class ModeARecorder: NSObject,
         if isWriting {
             while let pair = pairs.first {
                 guard let input = videoWriterInput, input.isReadyForMoreMediaData else {
-                    backpressureCount += 1; schedulePump(); break
+                    backpressureCount += 1; videoWriterNotReadyCount += 1; schedulePump(); break
                 }
                 guard let composed = compositor.composite(
                     frameA: pair.a.buffer, frameB: pair.b.buffer,
@@ -545,15 +656,21 @@ final class ModeARecorder: NSObject,
                     adaptor.append(composed, withPresentationTime: pair.a.pts) else {
                     fail(writer?.error ?? CameraError.recordingFailed("合成视频帧写入失败")); return
                 }
-                lastVideoPTS = pair.a.pts; pairs.removeFirst()
+                lastVideoPTS = pair.a.pts
+                telemetryA.writtenCount += 1; telemetryA.lastWrittenPTS = pair.a.pts
+                telemetryB.writtenCount += 1; telemetryB.lastWrittenPTS = pair.b.pts
+                pairs.removeFirst()
             }
             while let sample = audioSamples.first {
                 guard let input = audioWriterInput else { audioSamples.removeAll(); break }
-                guard input.isReadyForMoreMediaData else { schedulePump(); break }
+                guard input.isReadyForMoreMediaData else {
+                    audioWriterNotReadyCount += 1; schedulePump(); break
+                }
                 guard input.append(sample) else {
                     fail(writer?.error ?? CameraError.recordingFailed("音频写入失败")); return
                 }
                 lastAudioPTS = CMSampleBufferGetPresentationTimeStamp(sample)
+                telemetryAudio.writtenCount += 1; telemetryAudio.lastWrittenPTS = lastAudioPTS
                 audioSamples.removeFirst()
             }
         }
