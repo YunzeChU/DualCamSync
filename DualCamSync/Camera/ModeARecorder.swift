@@ -23,11 +23,20 @@ final class ModeARecorder: NSObject,
     AVCaptureVideoDataOutputSampleBufferDelegate,
     AVCaptureAudioDataOutputSampleBufferDelegate {
 
-    // MARK: - 单一媒体执行域（采集代理、合成、写入和收尾均串行）
+    // MARK: - Capture ingress and serialized composition/writing
 
     private let mediaQueue = DispatchQueue(label: "com.dualcamsync.media")
-    var videoQueueA: DispatchQueue { mediaQueue }
-    var videoQueueB: DispatchQueue { mediaQueue }
+    // AVCapture delegate callbacks must remain cheap. Rendering a Core Image frame on
+    // the delegate queue makes `alwaysDiscardsLateVideoFrames` discard camera samples
+    // before this recorder can observe them. These queues only coalesce ingress; all
+    // pairing, rendering, writing, and finalization remain serialized on mediaQueue.
+    private let captureQueueA = DispatchQueue(label: "com.dualcamsync.captureA")
+    private let captureQueueB = DispatchQueue(label: "com.dualcamsync.captureB")
+    var videoQueueA: DispatchQueue { captureQueueA }
+    var videoQueueB: DispatchQueue { captureQueueB }
+    // Audio remains ordered on the writer queue. Coalescing AAC samples would create
+    // an audio timeline with gaps, whereas the expensive work being isolated here is
+    // the two video composition paths.
     var audioQueue: DispatchQueue { mediaQueue }
     private var generation = UUID()
     private var finishing = false
@@ -53,6 +62,36 @@ final class ModeARecorder: NSObject,
     private var pendingFailure: Error?
     private let inputQuiescenceDelay: DispatchTimeInterval = .milliseconds(150)
 
+    /// Bounded handoff from AVCapture's callback queues to the slower compositor.
+    /// When overloaded, replacing the pending sample (rather than queueing every
+    /// sample) preserves the newest live image for the tail while bounding retained
+    /// camera buffers to one sample per source.
+    private enum IngressRoute { case videoA, videoB, audio }
+    /// A single retained value bounds camera buffer ownership even if rendering is
+    /// slower than capture. Timestamps remain those of the newest real sample.
+    struct LatestVideoValue<Value> {
+        private(set) var value: Value?
+        private(set) var replacements = 0
+
+        mutating func offer(_ value: Value) {
+            if self.value != nil { replacements += 1 }
+            self.value = value
+        }
+    }
+    private struct PendingIngress {
+        var latest = LatestVideoValue<(sample: CMSampleBuffer, connection: AVCaptureConnection)>()
+        var scheduled = false
+        var dropReasons: [String: Int] = [:]
+    }
+    private let ingressLock = NSLock()
+    private weak var ingressOutputA: AVCaptureVideoDataOutput?
+    private weak var ingressOutputB: AVCaptureVideoDataOutput?
+    private weak var ingressAudioOutput: AVCaptureAudioDataOutput?
+    private var ingressGeneration = UUID()
+    private var ingressOpen = true
+    private var ingressA = PendingIngress()
+    private var ingressB = PendingIngress()
+
     // MARK: - Per-recording tail diagnostics
 
     private enum CaptureStream { case videoA, videoB, audio }
@@ -74,6 +113,8 @@ final class ModeARecorder: NSObject,
     private var discardedB = 0
     private var videoWriterNotReadyCount = 0
     private var audioWriterNotReadyCount = 0
+    private var ingressCoalescedA = 0
+    private var ingressCoalescedB = 0
     private var stopRequestedAt: CFTimeInterval?
     private var inputSealedAt: CFTimeInterval?
 
@@ -176,6 +217,13 @@ final class ModeARecorder: NSObject,
         self.videoConnA = connA
         self.videoConnB = connB
         didVerifyHDRPipeline = false
+        ingressLock.lock()
+        ingressOutputA = videoOutputA
+        ingressOutputB = videoOutputB
+        ingressAudioOutput = audioOutput
+        ingressGeneration = UUID(); ingressOpen = true
+        ingressA = PendingIngress(); ingressB = PendingIngress()
+        ingressLock.unlock()
         }
     }
 
@@ -186,6 +234,11 @@ final class ModeARecorder: NSObject,
         audioOutput = nil
         videoConnA = nil
         videoConnB = nil
+        ingressLock.lock()
+        ingressOutputA = nil; ingressOutputB = nil; ingressAudioOutput = nil
+        ingressGeneration = UUID(); ingressOpen = false
+        ingressA = PendingIngress(); ingressB = PendingIngress()
+        ingressLock.unlock()
         }
     }
 
@@ -310,6 +363,10 @@ final class ModeARecorder: NSObject,
         self.isRecording = true
         self.accepting = true
         self.generation = UUID()
+        self.ingressLock.lock()
+        self.ingressGeneration = UUID(); self.ingressOpen = true
+        self.ingressA = PendingIngress(); self.ingressB = PendingIngress()
+        self.ingressLock.unlock()
         self.framesA = []; self.framesB = []; self.pairs = []; self.audioSamples = []
         self.lastVideoPTS = nil; self.lastAudioPTS = nil
         self.unmatchedCount = 0; self.backpressureCount = 0
@@ -318,6 +375,7 @@ final class ModeARecorder: NSObject,
         self.telemetryAudio = StreamTelemetry()
         self.discardedA = 0; self.discardedB = 0
         self.videoWriterNotReadyCount = 0; self.audioWriterNotReadyCount = 0
+        self.ingressCoalescedA = 0; self.ingressCoalescedB = 0
         self.stopRequestedAt = nil; self.inputSealedAt = nil
         self.stopDeadline = nil
         self.awaitingInputQuiescence = false
@@ -328,25 +386,42 @@ final class ModeARecorder: NSObject,
     }
 
 
-    // CameraManager disables source connections before stop. AVCapture can still hand off a
-    // final callback after that operation, so only seal input after a short bounded grace
-    // period; otherwise those final frames are rejected by `accepting` and the movie freezes
-    // before the user pressed stop.
+    // CameraManager disables source connections before stop. Give in-flight callbacks
+    // the existing handoff grace period, then require FIFO markers from both capture
+    // queues before sealing input. The delay alone is not a queue-drain guarantee.
     func stop() {
+        let requestedAt = CACurrentMediaTime()
         mediaQueue.async { [weak self] in
             guard let self, self.isRecording, !self.finishing else { return }
             self.finishing = true
             self.awaitingInputQuiescence = true
-            self.stopRequestedAt = CACurrentMediaTime()
+            self.stopRequestedAt = requestedAt
             self.stopDeadline = CACurrentMediaTime() + 3
             self.pump()
             let current = self.generation
             self.mediaQueue.asyncAfter(deadline: .now() + self.inputQuiescenceDelay) { [weak self] in
                 guard let self, self.generation == current, self.finishing else { return }
-                self.awaitingInputQuiescence = false
-                self.accepting = false
-                self.inputSealedAt = CACurrentMediaTime()
-                self.pump()
+                // FIFO markers establish that callbacks already on either capture
+                // queue have handed off their newest sample. Never synchronously
+                // wait on these queues from the writer domain.
+                let callbacksDrained = DispatchGroup()
+                callbacksDrained.enter()
+                self.captureQueueA.async { callbacksDrained.leave() }
+                callbacksDrained.enter()
+                self.captureQueueB.async { callbacksDrained.leave() }
+                callbacksDrained.notify(queue: self.mediaQueue) { [weak self] in
+                    guard let self, self.generation == current, self.finishing else { return }
+                    self.ingressLock.lock()
+                    let token = self.ingressGeneration
+                    self.ingressOpen = false
+                    self.ingressLock.unlock()
+                    self.drainIngress(.videoA, token: token)
+                    self.drainIngress(.videoB, token: token)
+                    self.awaitingInputQuiescence = false
+                    self.accepting = false
+                    self.inputSealedAt = CACurrentMediaTime()
+                    self.pump()
+                }
             }
         }
     }
@@ -356,10 +431,97 @@ final class ModeARecorder: NSObject,
     }
 
     private func clear() {
+        ingressLock.lock()
+        ingressGeneration = UUID(); ingressOpen = false
+        ingressA = PendingIngress(); ingressB = PendingIngress()
+        ingressLock.unlock()
         writer = nil; videoWriterInput = nil; audioWriterInput = nil
         pixelAdaptor = nil; outputURL = nil; sessionStartTime = nil
         isWriting = false
         framesA = []; framesB = []; pairs = []; audioSamples = []
+    }
+
+    private func routeLocked(for output: AVCaptureOutput) -> IngressRoute? {
+        if let ingressOutputA, output === ingressOutputA { return .videoA }
+        if let ingressOutputB, output === ingressOutputB { return .videoB }
+        if let ingressAudioOutput, output === ingressAudioOutput { return .audio }
+        return nil
+    }
+
+    private func enqueueIngress(_ route: IngressRoute,
+                                sample: CMSampleBuffer,
+                                connection: AVCaptureConnection,
+                                token: UUID) {
+        let shouldSchedule: Bool
+        ingressLock.lock()
+        guard token == ingressGeneration, ingressOpen else { ingressLock.unlock(); return }
+        switch route {
+        case .videoA:
+            ingressA.latest.offer((sample, connection))
+            shouldSchedule = !ingressA.scheduled; ingressA.scheduled = true
+        case .videoB:
+            ingressB.latest.offer((sample, connection))
+            shouldSchedule = !ingressB.scheduled; ingressB.scheduled = true
+        case .audio:
+            shouldSchedule = false
+        }
+        ingressLock.unlock()
+        guard shouldSchedule else { return }
+        mediaQueue.async { [weak self] in self?.drainIngress(route, token: token) }
+    }
+
+    private func enqueueDroppedFrame(_ route: IngressRoute, reason: String, token: UUID) {
+        let shouldSchedule: Bool
+        ingressLock.lock()
+        guard token == ingressGeneration, ingressOpen else { ingressLock.unlock(); return }
+        switch route {
+        case .videoA:
+            ingressA.dropReasons[reason, default: 0] += 1
+            shouldSchedule = !ingressA.scheduled; ingressA.scheduled = true
+        case .videoB:
+            ingressB.dropReasons[reason, default: 0] += 1
+            shouldSchedule = !ingressB.scheduled; ingressB.scheduled = true
+        case .audio:
+            shouldSchedule = false
+        }
+        ingressLock.unlock()
+        guard shouldSchedule else { return }
+        mediaQueue.async { [weak self] in self?.drainIngress(route, token: token) }
+    }
+
+    private func drainIngress(_ route: IngressRoute, token: UUID) {
+        dispatchPrecondition(condition: .onQueue(mediaQueue))
+        let pending: PendingIngress
+        ingressLock.lock()
+        guard token == ingressGeneration else { ingressLock.unlock(); return }
+        switch route {
+        case .videoA:
+            pending = ingressA; ingressA = PendingIngress()
+        case .videoB:
+            pending = ingressB; ingressB = PendingIngress()
+        case .audio:
+            ingressLock.unlock()
+            return
+        }
+        ingressLock.unlock()
+        switch route {
+        case .videoA: ingressCoalescedA += pending.latest.replacements
+        case .videoB: ingressCoalescedB += pending.latest.replacements
+        case .audio: break
+        }
+        let captureStream: CaptureStream?
+        switch route {
+        case .videoA: captureStream = .videoA
+        case .videoB: captureStream = .videoB
+        case .audio: captureStream = nil
+        }
+        if let captureStream {
+            for (reason, count) in pending.dropReasons {
+                recordDropped(captureStream, reason: reason, count: count)
+            }
+        }
+        guard let payload = pending.latest.value else { return }
+        processCaptureOutput(payload.sample, from: payload.connection)
     }
 
     private func recordReceived(_ stream: CaptureStream, pts: CMTime) {
@@ -373,10 +535,10 @@ final class ModeARecorder: NSObject,
         }
     }
 
-    private func recordDropped(_ stream: CaptureStream, reason: String) {
+    private func recordDropped(_ stream: CaptureStream, reason: String, count: Int = 1) {
         switch stream {
-        case .videoA: telemetryA.dropReasons[reason, default: 0] += 1
-        case .videoB: telemetryB.dropReasons[reason, default: 0] += 1
+        case .videoA: telemetryA.dropReasons[reason, default: 0] += count
+        case .videoB: telemetryB.dropReasons[reason, default: 0] += count
         case .audio: break
         }
     }
@@ -409,7 +571,7 @@ final class ModeARecorder: NSObject,
         }
         let status = writerStatus.map { String(describing: $0) } ?? "none"
         let error = writerError?.localizedDescription ?? "none"
-        print("[ModeA][TailSummary] event=\(event) stopToSeal=\(stopToSeal) writerStatus=\(status) writerError=\(error) A{\(telemetryDescription(telemetryA))} B{\(telemetryDescription(telemetryB))} audio{\(telemetryDescription(telemetryAudio))} discardedA=\(discardedA) discardedB=\(discardedB) writerNotReady(video=\(videoWriterNotReadyCount),audio=\(audioWriterNotReadyCount)) unmatched=\(unmatchedCount) startupSkipped=\(startupSkipped)")
+        print("[ModeA][TailSummary] event=\(event) stopToSeal=\(stopToSeal) writerStatus=\(status) writerError=\(error) A{\(telemetryDescription(telemetryA))} B{\(telemetryDescription(telemetryB))} audio{\(telemetryDescription(telemetryAudio))} ingressCoalesced(A=\(ingressCoalescedA),B=\(ingressCoalescedB)) discardedA=\(discardedA) discardedB=\(discardedB) writerNotReady(video=\(videoWriterNotReadyCount),audio=\(audioWriterNotReadyCount)) unmatched=\(unmatchedCount) startupSkipped=\(startupSkipped)")
     }
 
     private func fail(_ error: Error) {
@@ -487,10 +649,24 @@ final class ModeARecorder: NSObject,
     func captureOutput(_ output: AVCaptureOutput,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        if output is AVCaptureVideoDataOutput {
-            let isA = connection === videoConnA
-            guard isA || connection === videoConnB,
-                  let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        ingressLock.lock()
+        let route = routeLocked(for: output)
+        let token = ingressGeneration
+        ingressLock.unlock()
+        guard let route else { return }
+        if case .audio = route {
+            processCaptureOutput(sampleBuffer, from: connection)
+            return
+        }
+        enqueueIngress(route, sample: sampleBuffer, connection: connection, token: token)
+    }
+
+    private func processCaptureOutput(_ sampleBuffer: CMSampleBuffer,
+                                      from connection: AVCaptureConnection) {
+        dispatchPrecondition(condition: .onQueue(mediaQueue))
+        let isA = connection === videoConnA
+        if isA || connection === videoConnB {
+            guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             let stream: CaptureStream = isA ? .videoA : .videoB
             let samplePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
             recordReceived(stream, pts: samplePTS)
@@ -570,14 +746,16 @@ final class ModeARecorder: NSObject,
     func captureOutput(_ output: AVCaptureOutput,
                        didDrop sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
-        guard output is AVCaptureVideoDataOutput else { return }
-        let isA = connection === videoConnA
-        guard isA || connection === videoConnB else { return }
-        let attachments = CMSampleBufferGetSampleAttachmentsArray(
-            sampleBuffer, createIfNecessary: false) as? [[CFString: Any]]
+        ingressLock.lock()
+        let route = routeLocked(for: output)
+        let token = ingressGeneration
+        ingressLock.unlock()
+        guard let route else { return }
+        if case .audio = route { return }
         let reason = Self.droppedFrameReasonDescription(
-            attachments?.first?[kCMSampleBufferAttachmentKey_DroppedFrameReason])
-        recordDropped(isA ? .videoA : .videoB, reason: reason)
+            CMGetAttachment(sampleBuffer, key: kCMSampleBufferAttachmentKey_DroppedFrameReason,
+                            attachmentModeOut: nil))
+        enqueueDroppedFrame(route, reason: reason, token: token)
     }
 
     private func schedulePump() {

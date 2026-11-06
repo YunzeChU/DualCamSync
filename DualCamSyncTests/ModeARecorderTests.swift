@@ -70,10 +70,47 @@ final class ModeARecorderTests: XCTestCase {
         XCTAssertEqual(ModeARecorder.pairingDecision(a: 0, b: 0.1), .discardA)
     }
 
-    func testAllSampleCallbacksShareWriterExecutionDomain() {
+    func testVideoCaptureCallbacksAreIsolatedFromWriterDomain() {
         let recorder = ModeARecorder()
-        XCTAssertTrue(recorder.videoQueueA === recorder.videoQueueB)
-        XCTAssertTrue(recorder.videoQueueA === recorder.audioQueue)
+        XCTAssertFalse(recorder.videoQueueA === recorder.videoQueueB)
+        XCTAssertFalse(recorder.videoQueueA === recorder.audioQueue)
+        XCTAssertFalse(recorder.videoQueueB === recorder.audioQueue)
+    }
+
+    func testOverloadedVideoHandoffRetainsNewestValueAndReleasesOldBuffer() {
+        var handoff = ModeARecorder.LatestVideoValue<NSObject>()
+        var first: NSObject? = NSObject()
+        weak var oldBuffer = first
+        handoff.offer(first!)
+        first = nil
+        XCTAssertNotNil(oldBuffer)
+        let newest = NSObject()
+        for _ in 0..<1_000 { handoff.offer(newest) }
+        XCTAssertNil(oldBuffer, "Overload must not retain a growing queue of camera buffers")
+        XCTAssertTrue(handoff.value === newest)
+        XCTAssertEqual(handoff.replacements, 1_000)
+    }
+
+    func testStopWaitsForCaptureQueueMarkerBeyondGracePeriod() throws {
+        let recorder = ModeARecorder()
+        let captureGate = DispatchSemaphore(value: 0)
+        let entered = expectation(description: "capture callback in flight")
+        recorder.videoQueueB.async {
+            entered.fulfill()
+            captureGate.wait()
+        }
+        defer { captureGate.signal() }
+        wait(for: [entered], timeout: 1)
+        let finished = expectation(description: "finished after capture handoff")
+        let start = Date()
+        recorder.onFinished = { _ in
+            XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(start), 0.28)
+            finished.fulfill()
+        }
+        try startEmpty(recorder)
+        recorder.stop()
+        DispatchQueue.global().asyncAfter(deadline: .now() + 0.30) { captureGate.signal() }
+        wait(for: [finished], timeout: 2)
     }
 
     func testHDRValidationAcceptsOnlyP010InputFormats() {
