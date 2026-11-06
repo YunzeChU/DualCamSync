@@ -1155,7 +1155,7 @@ final class CameraManager {
                     return nil
                 }
                 let settings = output.outputSettings(for: connection)
-                let codecValue = settings?[AVVideoCodecKey]
+                let codecValue = settings[AVVideoCodecKey]
                 let effectiveCodec: String?
                 if let codec = codecValue as? AVVideoCodecType {
                     effectiveCodec = codec.rawValue
@@ -1168,8 +1168,8 @@ final class CameraManager {
                     slot: slot,
                     availableCodecs: output.availableVideoCodecTypes.map(\.rawValue).sorted(),
                     effectiveCodec: effectiveCodec,
-                    hasOutputSettings: settings != nil,
-                    outputSettingKeys: settings.map { $0.keys.sorted() } ?? [],
+                    hasOutputSettings: true,
+                    outputSettingKeys: settings.keys.sorted(),
                     acceptsCodecSetting: output.supportedOutputSettingsKeys(for: connection)
                         .contains(AVVideoCodecKey)
                 )
