@@ -20,7 +20,7 @@ iOS 原生双摄像头同时录制 App（SwiftUI + `AVCaptureMultiCamSession` + 
 | 双路实时预览 | 分屏（竖屏上下/横屏左右）/ 画中画（主全屏+副窗），一键切换；**PIP 小窗可拖动**、默认位置在左上角（竖屏顶 60/左 16，横屏顶 24/左 24） |
 | 每路独立控制 | 对焦锁定、曝光锁定、曝光补偿滑块（A/B 两路独立，互不影响） |
 | 分辨率/帧率 | 4K30 / 1080P60 / 1080P30，全局统一，不支持档位自动置灰并自动降级（4K60 档已移除：多摄双路 4K60 超出带宽限制） |
-| 杜比视界 HDR | 按多摄兼容 HDR 格式与输出能力探测；合成模式请求 P010、HEVC Main10/HLG 和自动动态元数据，双文件使用公开 HEVC。当前修复版仍需构建与真机文件级验证，不宣称所有组合已支持 |
+| 10-bit HDR / HEVC | 依据当前镜头组合、档位和多摄能力选择 HLG 10-bit 格式；合成模式使用 P010 + HEVC Main10，双文件模式使用公开 HEVC。任一路不具备可用条件时，界面会明确置灰或回退 SDR |
 | 视频防抖 | A/B 两路分别开启/关闭 |
 | 空间音频 | 双文件模式原生支持（First Order Ambisonics + 立体声兼容轨），自动能力探测 |
 | 录制模式 A | 两路合成为**单条 MP4**（构图跟随录制前预览布局：**成片小窗位置 = 录制开始时的预览位置，拍后固定；小窗圆角与预览一致**），HEVC + 立体声 AAC |
@@ -110,6 +110,14 @@ open DualCamSync.xcodeproj
 ### 音画同步（模式A）
 - `AVCaptureMultiCamSession` 把所有设备时钟同步到 `masterClock`，各路样本 PTS 处于同一时间基准，写入 `AVAssetWriter` 即帧级对齐；首样本时间作为 `startSession(atSourceTime:)` 起点。
 
+### 10-bit HDR 与 HEVC
+- HDR 格式选择优先采用适合 HEVC 的 10-bit 4:2:0 HLG 格式（例如 `x420`），而不是会把 Movie File Output 限制到 ProRes 的 4:2:2 路径。
+- 合成模式先完成两台相机的 HDR/HLG 格式配置，再请求两路 P010 输出；写入端使用 HEVC Main10 与 BT.2020/HLG 色彩属性。
+- 双文件模式在会话完成 HDR 配置后，逐路确认 HEVC 可用并读取实际生效的输出设置；无法同时满足两路 HEVC 时不静默交付 ProRes 文件。
+- 已在后置广角 + 后置超广角的真机组合上确认：两路当前格式为 HLG `x420`，模式 A 的 P010 首帧通过，模式 B 两路实际编码为 `hvc1`。
+
+这些记录证明了当前设备上的 10-bit HLG HDR 与 HEVC 采集/编码路径已经建立；它们本身不等同于 Dolby Vision 成片证明。Dolby Vision 动态元数据仍须以导出文件的配置记录和元数据检查为准。
+
 ### 空间音频 / 立体声
 - 双文件模式：`audioInput.multichannelAudioMode = .firstOrderAmbisonics`（需 `isMultichannelAudioModeSupported` 探测），MovieFileOutput 自动写出「空间音频轨 + 立体声兼容轨」。
 - 合成模式：以真实采集声道数动态创建 AAC 输入（双声道立体声优先），保证写入不失败。
@@ -136,7 +144,7 @@ open DualCamSync.xcodeproj
 
 | 项 | 说明 |
 |---|---|
-| 杜比视界 | 支持范围取决于设备、镜头组合、规格和实际输出。Main10/HLG 或 hvc1 标记本身不足以证明 Dolby Vision；需检查 Dolby 配置记录与动态元数据。旧版 raw dvhe 输出设置路径曾触发真机异常，当前使用公开 HEVC 并增加窄异常边界 |
+| Dolby Vision 成片 | 当前已验证 10-bit HLG HDR 与 HEVC 路径；Main10/HLG 或 `hvc1` 标记本身不足以证明 Dolby Vision。若需标称 Dolby Vision，仍需检查导出文件的 Dolby 配置记录与动态元数据 |
 | 空间音频 | 仅双文件模式（MovieFileOutput 原生支持）；合成模式固定立体声 |
 | 免费签名 | 7 天有效期，到期重签；两台设备共用同一 Apple ID 签名会互相顶掉，请保持单一设备 |
 
