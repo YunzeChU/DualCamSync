@@ -1,5 +1,7 @@
 import XCTest
 import UIKit
+import CoreMedia
+import CoreVideo
 @testable import DualCamSync
 
 final class CameraLogicTests: XCTestCase {
@@ -80,12 +82,13 @@ final class CameraLogicTests: XCTestCase {
 
     // MARK: - HDR output policy
 
-    func testDolbyMovieOutputDoesNotRequireRedundantCodecSetter() {
-        // HDR is selected by activeFormat/HLG color space. Re-applying the same
-        // HEVC setting to AVCaptureMovieFileOutput can be rejected on device and
-        // must not turn the user-visible HDR switch back off.
-        XCTAssertFalse(CameraManager.movieOutputNeedsCodecSetter(forDolbyEnabled: true))
-        XCTAssertTrue(CameraManager.movieOutputNeedsCodecSetter(forDolbyEnabled: false))
+    func testCompositeP010SelectionAcceptsBothRangesAndRejectsSDR() {
+        let videoRange = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+        let fullRange = kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+        XCTAssertEqual(CameraManager.preferredP010Format(in: [fullRange]), fullRange)
+        XCTAssertEqual(CameraManager.preferredP010Format(in: [fullRange, videoRange]), videoRange)
+        XCTAssertNil(CameraManager.preferredP010Format(in: [kCVPixelFormatType_32BGRA]))
+        XCTAssertNil(CameraManager.preferredP010Format(in: []))
     }
 
     func testMovieCodecDiagnosticIncludesAvailabilityAndEffectiveSetting() {
@@ -104,7 +107,27 @@ final class CameraLogicTests: XCTestCase {
         XCTAssertTrue(diagnostic.contains("codecKey=否"))
     }
 
+    func testMovieHDRSubtypePolicyRejectsProResAndPrefersX420() {
+        let proRes422HQ: FourCharCode = 0x61706368 // apch
+        let x422: FourCharCode = 0x78343232
+        let x420: FourCharCode = 0x78343230
+        XCTAssertFalse(CameraManager.isMovieHDRSubtypeEligible(proRes422HQ))
+        XCTAssertFalse(CameraManager.isMovieHDRSubtypeEligible(x422))
+        XCTAssertTrue(CameraManager.isMovieHDRSubtypeEligible(x420))
+        XCTAssertLessThan(CameraManager.movieHDRSubtypePriority(x420),
+                          CameraManager.movieHDRSubtypePriority(0x34323076))
+    }
+
     // MARK: - 双路 HDR 能力与 SDR 回退诊断
+
+    func testHLGFormatsRemainEligibleWithoutLegacyVideoHDRFlag() {
+        let result = CameraManager.assessHDRCapability(
+            preset: .hd30, mode: .dualFiles,
+            formatsA: [hdrFormat(width: 1920, height: 1080, hdr: false)],
+            formatsB: [hdrFormat(width: 1920, height: 1080, hdr: false)]
+        )
+        XCTAssertTrue(result.isAvailable)
+    }
 
     private func hdrFormat(width: Int32 = 3840, height: Int32 = 2160,
                            minFPS: Double = 24, maxFPS: Double = 30,

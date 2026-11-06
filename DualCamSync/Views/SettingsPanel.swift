@@ -35,8 +35,8 @@ struct SettingsPanel: View {
                     }
                 }
 
-                // 杜比视界 HDR（模式A 合成、模式B 双文件均支持）
-                Toggle("杜比视界 HDR (Dolby Vision)", isOn: Binding(
+                // Output files must independently establish Dolby metadata.
+                Toggle("10-bit HDR（HEVC）", isOn: Binding(
                     get: { camera.dolbyVisionEnabled },
                     set: { camera.setDolbyVision($0) }
                 ))
@@ -46,18 +46,18 @@ struct SettingsPanel: View {
                           || camera.isFinalizing)
                 .opacity(camera.isDolbyVisionAvailable ? 1 : 0.35)
                 if !camera.isDolbyVisionAvailable {
-                    hint("当前设备/镜头组合/档位不支持杜比视界 HDR，已自动置灰")
+                    hint("当前镜头组合或档位无法使用 HEVC HDR，已自动置灰")
                 } else if camera.dolbyVisionEnabled {
-                    hint("正在以 Dolby Vision 录制：10-bit HDR 采集、合成、成片全链路")
+                    hint("已开启 10-bit HDR，使用节省空间的 HEVC 编码")
                 } else {
-                    hint("开启后以杜比视界（10-bit HDR）录制；当前档位不支持时自动关闭并提示")
+                    hint("开启后使用 HEVC 录制 10-bit HDR；不支持时会回退普通录制并提示")
                 }
                 // 杜比能力诊断（真机验证用，验证后可删）：两路 formats 统计
                 // + 模式A 首帧实测输出格式
                 if !camera.hdrFormatDiagnostics.isEmpty {
                     hint("诊断 \(camera.hdrFormatDiagnostics)")
                     if camera.compositeOutputIsHDR {
-                        hint("运行时实测输出10-bit：\(camera.hdrPipelineVerified ? (camera.hdrPipelineOK ? "是" : "否") : "待首帧")")
+                        hint("A 路首帧 10-bit 探测：\(camera.hdrPipelineVerified ? (camera.hdrPipelineOK ? "是" : "否") : "待首帧")；录制时另行校验双路")
                     }
                 }
 
