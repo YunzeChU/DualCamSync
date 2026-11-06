@@ -88,6 +88,22 @@ final class CameraLogicTests: XCTestCase {
         XCTAssertTrue(CameraManager.movieOutputNeedsCodecSetter(forDolbyEnabled: false))
     }
 
+    func testMovieCodecDiagnosticIncludesAvailabilityAndEffectiveSetting() {
+        let diagnostic = CameraManager.movieCodecDiagnostic([
+            .init(slot: .a, availableCodecs: ["hvc1", "ap4h"],
+                  effectiveCodec: "ap4h", hasOutputSettings: true,
+                  outputSettingKeys: ["AVVideoCodecKey"], acceptsCodecSetting: true),
+            .init(slot: .b, availableCodecs: ["hvc1"],
+                  effectiveCodec: nil, hasOutputSettings: false,
+                  outputSettingKeys: [], acceptsCodecSetting: false),
+        ], label: "当前")
+        XCTAssertTrue(diagnostic.contains("A{可用=hvc1,ap4h"))
+        XCTAssertTrue(diagnostic.contains("当前=ap4h"))
+        XCTAssertTrue(diagnostic.contains("B{可用=hvc1"))
+        XCTAssertTrue(diagnostic.contains("当前=系统未声明"))
+        XCTAssertTrue(diagnostic.contains("codecKey=否"))
+    }
+
     // MARK: - 双路 HDR 能力与 SDR 回退诊断
 
     private func hdrFormat(width: Int32 = 3840, height: Int32 = 2160,

@@ -69,6 +69,33 @@ final class CameraManager {
         var sdrFallbackReason: String { reason.message }
     }
 
+    /// Public-API snapshot of a MovieFileOutput video connection. It captures
+    /// what the framework reports; it never changes codec configuration.
+    struct MovieCodecObservation: Equatable {
+        let slot: CameraSlot
+        let availableCodecs: [String]
+        let effectiveCodec: String?
+        let hasOutputSettings: Bool
+        let outputSettingKeys: [String]
+        let acceptsCodecSetting: Bool
+    }
+
+    static func movieCodecDiagnostic(_ observations: [MovieCodecObservation],
+                                     label: String) -> String {
+        guard !observations.isEmpty else { return "模式B编码\(label)：录像输出未就绪" }
+        let routes = observations.map { observation in
+            let available = observation.availableCodecs.isEmpty
+                ? "无"
+                : observation.availableCodecs.joined(separator: ",")
+            let effective = observation.effectiveCodec ?? "系统未声明"
+            return "\(observation.slot.displayName){可用=\(available),当前=\(effective),"
+                + "设置=\(observation.hasOutputSettings ? "有" : "无"),"
+                + "键=\(observation.outputSettingKeys.joined(separator: ",")),"
+                + "codecKey=\(observation.acceptsCodecSetting ? "是" : "否")}"
+        }
+        return "模式B编码\(label)：\(routes.joined(separator: "；"))"
+    }
+
     /// Decides HDR eligibility without AVFoundation objects, so the exact
     /// two-camera agreement and SDR fallback reason can be unit tested.
     static func assessHDRCapability(
@@ -193,6 +220,8 @@ final class CameraManager {
     // 模式B（双文件）输出
     private var movieOutputA: AVCaptureMovieFileOutput?
     private var movieOutputB: AVCaptureMovieFileOutput?
+    /// 输出刚挂接时的系统报告值。仅用于对比默认值与配置后的有效值。
+    private var movieOutputDefaultCodecDiagnostics = ""
     private let modeBRecorder = ModeBRecorder()
 
     // 模式A（合成）输出
@@ -530,6 +559,7 @@ final class CameraManager {
         modeARecorder.detach()
         movieOutputA = nil
         movieOutputB = nil
+        movieOutputDefaultCodecDiagnostics = ""
         videoDataOutputA = nil
         videoDataOutputB = nil
         audioDataOutput = nil
@@ -713,6 +743,9 @@ final class CameraManager {
         // activeFormat 同锁设置）；dvhe 编码器由 refreshDolbyCapability
         // 按可用性设置（applyOutputCodec），此处无需连接级配置。
         modeBRecorder.attach(outputA: outA, outputB: outB)
+        // Capture the framework's initial choice before any SDR codec request.
+        // This is observation only; HDR still does not call setOutputSettings.
+        movieOutputDefaultCodecDiagnostics = movieOutputCodecDiagnostics(label: "默认")
         // 录制完成/失败回调由 startRecording 按"收尾代际"统一设置
         // （attach 阶段不设：回调只在本轮录制触发，且需捕获当时的 token）
     }
@@ -1010,8 +1043,6 @@ final class CameraManager {
         let assessment = currentHDRCapabilityAssessment()
         let available = assessment.isAvailable
         isDolbyVisionAvailable = available
-        hdrFormatDiagnostics = "\(buildHDRDiagnostics())；HDR判定：\(assessment.sdrFallbackReason)"
-        print("DCS HDR capability preset=\(preset.rawValue) mode=\(mode.rawValue) available=\(available) reason=\(assessment.sdrFallbackReason)")
         if dolbyVisionEnabled && !available {
             dolbyVisionEnabled = false
             persistSettings()   // 自动关闭落盘：下次启动不再恢复开启→再关→重复弹窗
@@ -1033,6 +1064,9 @@ final class CameraManager {
                 _ = try applyOutputCodec(useDolby: false)
             }
         }
+        hdrFormatDiagnostics = "\(buildHDRDiagnostics())；HDR判定：\(assessment.sdrFallbackReason)"
+        let modeBCodecLog = mode == .dualFiles ? " \(movieOutputCodecDiagnostics(label: "当前"))" : ""
+        print("DCS HDR capability preset=\(preset.rawValue) mode=\(mode.rawValue) available=\(available) reason=\(assessment.sdrFallbackReason)\(modeBCodecLog)")
     }
 
     /// 使用公开 HEVC 编码类型；Dolby Vision 8.4 不是另一个 capture codec。
@@ -1108,6 +1142,42 @@ final class CameraManager {
         return nil
     }
 
+    /// Read the MovieFileOutput state through public AVFoundation accessors.
+    /// The result is deliberately diagnostic-only: it must not influence codec
+    /// selection until real-device samples establish a safe policy.
+    private func movieOutputCodecDiagnostics(label: String) -> String {
+        let outputs: [(CameraSlot, AVCaptureMovieFileOutput?)] = [(.a, movieOutputA), (.b, movieOutputB)]
+        let observations = outputs.flatMap { slot, output -> [MovieCodecObservation] in
+            guard let output else { return [] }
+            return output.connections.compactMap { connection in
+                guard connection.isEnabled,
+                      connection.inputPorts.contains(where: { $0.mediaType == .video }) else {
+                    return nil
+                }
+                let settings = output.outputSettings(for: connection)
+                let codecValue = settings?[AVVideoCodecKey]
+                let effectiveCodec: String?
+                if let codec = codecValue as? AVVideoCodecType {
+                    effectiveCodec = codec.rawValue
+                } else if let codec = codecValue as? String {
+                    effectiveCodec = codec
+                } else {
+                    effectiveCodec = nil
+                }
+                return MovieCodecObservation(
+                    slot: slot,
+                    availableCodecs: output.availableVideoCodecTypes.map(\.rawValue).sorted(),
+                    effectiveCodec: effectiveCodec,
+                    hasOutputSettings: settings != nil,
+                    outputSettingKeys: settings.map { $0.keys.sorted() } ?? [],
+                    acceptsCodecSetting: output.supportedOutputSettingsKeys(for: connection)
+                        .contains(AVVideoCodecKey)
+                )
+            }
+        }
+        return Self.movieCodecDiagnostic(observations, label: label)
+    }
+
     /// 两路 HDR 格式探测摘要（真机诊断用，验证后可删）：
     /// "镜头名 共N/多摄N/HDR N/档位HDR N"——总数 / 多摄兼容 / 官方 HDR
     /// 标志 / 当前档位（尺寸+帧率）可用的 HDR 格式数
@@ -1134,13 +1204,10 @@ final class CameraManager {
         let codecDiag: String
         switch mode {
         case .dualFiles:
-            // 标注"10bit连接"：开关关（连接为 8-bit）时显示"否"属正常；
-            // 开关开（applyFormat 已切 10-bit）后重建诊断，此时才是 dvhe
-            // 是否真可用的答案（先切后验，真机验证点）。
-            let dvheOK = [movieOutputA, movieOutputB].compactMap { $0 }.allSatisfy {
-                $0.availableVideoCodecTypes.contains(.hevc)
-            }
-            codecDiag = "模式B-HEVC:\(dvheOK ? "是" : "否")（杜比元数据待成片验证）"
+            let defaultValue = movieOutputDefaultCodecDiagnostics.isEmpty
+                ? "模式B编码默认：未记录"
+                : movieOutputDefaultCodecDiagnostics
+            codecDiag = "\(defaultValue)；\(movieOutputCodecDiagnostics(label: "当前"))"
         case .composite:
             let p010OK = [videoDataOutputA, videoDataOutputB].compactMap { $0 }.allSatisfy {
                 $0.availableVideoPixelFormatTypes
