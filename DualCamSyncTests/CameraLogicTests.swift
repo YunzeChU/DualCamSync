@@ -6,6 +6,56 @@ import CoreVideo
 
 final class CameraLogicTests: XCTestCase {
 
+    func testStoppingEitherRecordingModeClearsElapsedBeforeFinalizing() {
+        for mode in [RecordingMode.composite, .dualFiles] {
+            let camera = CameraManager()
+            camera.mode = mode
+            camera.isRecording = true
+            camera.recordingElapsed = 12.3
+
+            camera.stopRecording()
+
+            XCTAssertEqual(camera.recordingElapsed, 0)
+            XCTAssertFalse(camera.isRecording)
+            XCTAssertTrue(camera.isFinalizing)
+        }
+    }
+
+    func testStoppingDuringCompositeStartupClearsElapsedWithoutWriterCallback() {
+        let camera = CameraManager()
+        camera.mode = .composite
+        camera.isRecording = true
+        camera.isStarting = true
+        camera.recordingElapsed = 8.1
+
+        camera.stopRecording()
+
+        XCTAssertEqual(camera.recordingElapsed, 0)
+        XCTAssertFalse(camera.isStarting)
+    }
+
+    func testIdleRecordingAttemptClearsPreviousElapsedEvenWhenUnavailable() {
+        let camera = CameraManager()
+        camera.isMultiCamSupported = false
+        camera.recordingElapsed = 21
+
+        camera.startRecording()
+
+        XCTAssertEqual(camera.recordingElapsed, 0)
+        XCTAssertFalse(camera.isRecording)
+    }
+
+    func testDuplicateStartDoesNotResetCurrentRecordingTimer() {
+        let camera = CameraManager()
+        camera.isRecording = true
+        camera.recordingElapsed = 4.2
+
+        camera.startRecording()
+
+        XCTAssertEqual(camera.recordingElapsed, 4.2)
+        XCTAssertTrue(camera.isRecording)
+    }
+
     // MARK: - 方向映射（后置标准映射 / 前置独立映射，防横屏 180° 复发）
 
     func testRearPortraitAngle() {

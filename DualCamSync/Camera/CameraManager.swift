@@ -1654,13 +1654,18 @@ final class CameraManager {
 
     /// 开始录制：按当前布局/方向/规格启动对应录制器
     func startRecording() {
-        guard !isRecording, !isFinalizing, isMultiCamSupported, cameraA != nil, cameraB != nil else {
+        guard !isRecording, !isFinalizing else {
             if isFinalizing {
                 // 上一段还在收尾（约 1 秒）：明确提示，避免"点了没反应"
                 error = .recordingFailed("上一段视频正在保存，请稍候再录")
             }
             return
         }
+        // A new attempt must show zero even while the compositor waits for its
+        // first video/audio samples. Its writer-start callback starts counting
+        // later; it must never be responsible for clearing the previous take.
+        stopElapsedTimer()
+        guard isMultiCamSupported, cameraA != nil, cameraB != nil else { return }
         // 会话未就绪时明确报错，避免"点了没反应"的错觉（按键必须立即有反馈）
         guard session.isRunning else {
             error = .recordingFailed("相机会话未就绪，请稍后重试")
@@ -1724,6 +1729,7 @@ final class CameraManager {
             isStarting = mode == .composite
             if !isStarting { startElapsedTimer() }
         } catch {
+            stopElapsedTimer()
             self.error = (error as? CameraError) ?? .recordingFailed(error.localizedDescription)
         }
     }
@@ -1874,7 +1880,7 @@ final class CameraManager {
         recordingElapsed = 0
         elapsedTimer?.invalidate()
         elapsedTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-            guard let self else { return }
+            guard let self, self.isRecording, !self.isStarting else { return }
             self.recordingElapsed += 0.1
         }
     }
@@ -1882,6 +1888,7 @@ final class CameraManager {
     private func stopElapsedTimer() {
         elapsedTimer?.invalidate()
         elapsedTimer = nil
+        recordingElapsed = 0
     }
 
     // MARK: - 系统监控（高温/内存）
