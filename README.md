@@ -12,6 +12,16 @@ iOS 原生双摄像头同时录制 App（SwiftUI + `AVCaptureMultiCamSession` + 
 
 ---
 
+## 结项状态
+
+用户已完成本轮真机验收，确认 HDR 成片正常、HEVC 编码符合预期，连续录制时计时器从 `00:00` 开始，停止后不再残留上一段时长。本次收尾移除了设置页的格式计数、P010、首帧和 codec 开发诊断文字，保留 HDR/HEVC 开关及必要的可用性、回退和失败提示。
+
+用户接受合成模式成片尾部约 1 秒的差异作为当前产品边界，本次结项停止继续修复该项。这不表示尾部差异已消除，也不表示所有镜头组合、档位和录制条件均已逐帧验收。
+
+已验收的计时修复基线为 `a8d7dea`，对应 [CI 43022552676](https://github.com/YunzeChU/DualCamSync/actions/runs/43022552676)（41 项 XCTest、设备 Release 构建和 IPA 打包通过）。最终设置页收尾版本以本 README 所在提交及对应安装包的 `build-provenance.json` 为准；该文件记录实际 commit、run ID 和 build，不能用基线 CI 代替最终提交的构建结果。验收范围详见 [VERIFICATION.md](VERIFICATION.md)。
+
+---
+
 ## 功能一览
 
 | 功能 | 说明 |
@@ -116,7 +126,7 @@ open DualCamSync.xcodeproj
 - 双文件模式在会话完成 HDR 配置后，逐路确认 HEVC 可用并读取实际生效的输出设置；无法同时满足两路 HEVC 时不静默交付 ProRes 文件。
 - 已在后置广角 + 后置超广角的真机组合上确认：两路当前格式为 HLG `x420`，模式 A 的 P010 首帧通过，模式 B 两路实际编码为 `hvc1`。
 
-这些记录证明了当前设备上的 10-bit HLG HDR 与 HEVC 采集/编码路径已经建立；它们本身不等同于 Dolby Vision 成片证明。Dolby Vision 动态元数据仍须以导出文件的配置记录和元数据检查为准。
+用户已确认当前实测范围内的 HDR 成片正常。这些记录与反馈支持本次 HDR/HEVC 功能验收；未据此额外声明所有导出文件均具有 Dolby Vision 动态元数据，该判断应以相应原片的配置记录和元数据为依据。
 
 ### 空间音频 / 立体声
 - 双文件模式：`audioInput.multichannelAudioMode = .firstOrderAmbisonics`（需 `isMultichannelAudioModeSupported` 探测），MovieFileOutput 自动写出「空间音频轨 + 立体声兼容轨」。
@@ -140,11 +150,12 @@ open DualCamSync.xcodeproj
 
 ---
 
-## 已知限制（符合预期，非缺陷）
+## 已知限制与验收边界
 
 | 项 | 说明 |
 |---|---|
-| Dolby Vision 成片 | 当前已验证 10-bit HLG HDR 与 HEVC 路径；Main10/HLG 或 `hvc1` 标记本身不足以证明 Dolby Vision。若需标称 Dolby Vision，仍需检查导出文件的 Dolby 配置记录与动态元数据 |
+| 合成模式尾部 | 用户接受当前成片尾部约 1 秒的差异，本次结项不再继续修复；不承诺尾部差异已消除或所有规格均逐帧完整 |
+| HDR 验收范围 | 用户确认当前实测 HDR 成片正常；未测试的镜头、档位、压力条件不作全覆盖保证。Main10/HLG 或 `hvc1` 本身不能单独证明 Dolby Vision 动态元数据 |
 | 空间音频 | 仅双文件模式（MovieFileOutput 原生支持）；合成模式固定立体声 |
 | 免费签名 | 7 天有效期，到期重签；两台设备共用同一 Apple ID 签名会互相顶掉，请保持单一设备 |
 

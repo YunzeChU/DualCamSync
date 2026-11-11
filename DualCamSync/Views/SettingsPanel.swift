@@ -52,15 +52,6 @@ struct SettingsPanel: View {
                 } else {
                     hint("开启后使用 HEVC 录制 10-bit HDR；不支持时会回退普通录制并提示")
                 }
-                // 杜比能力诊断（真机验证用，验证后可删）：两路 formats 统计
-                // + 模式A 首帧实测输出格式
-                if !camera.hdrFormatDiagnostics.isEmpty {
-                    hint("诊断 \(camera.hdrFormatDiagnostics)")
-                    if camera.compositeOutputIsHDR {
-                        hint("A 路首帧 10-bit 探测：\(camera.hdrPipelineVerified ? (camera.hdrPipelineOK ? "是" : "否") : "待首帧")；录制时另行校验双路")
-                    }
-                }
-
                 // 空间音频
                 Toggle("空间音频 (Spatial Audio)", isOn: Binding(
                     get: { camera.spatialAudioEnabled },
