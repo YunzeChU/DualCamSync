@@ -18,7 +18,7 @@ iOS 原生双摄像头同时录制 App（SwiftUI + `AVCaptureMultiCamSession` + 
 
 用户接受合成模式成片尾部约 1 秒的差异作为当前产品边界，本次结项停止继续修复该项。这不表示尾部差异已消除，也不表示所有镜头组合、档位和录制条件均已逐帧验收。
 
-已验收的计时修复基线为 `a8d7dea`，对应 [CI 43022552676](https://github.com/YunzeChU/DualCamSync/actions/runs/43022552676)（41 项 XCTest、设备 Release 构建和 IPA 打包通过）。最终设置页收尾版本以本 README 所在提交及对应安装包的 `build-provenance.json` 为准；该文件记录实际 commit、run ID 和 build，不能用基线 CI 代替最终提交的构建结果。验收范围详见 [VERIFICATION.md](VERIFICATION.md)。
+冻结的产品基线为 `49f0ac5`，对应 [CI 43023968187](https://github.com/YunzeChU/DualCamSync/actions/runs/43023968187)：41 项 XCTest、设备 Release 构建和 IPA 打包均通过，交付 artifact 为 [13856596856](https://github.com/YunzeChU/DualCamSync/actions/runs/43023968187/artifacts/13856596856)。本次文档更新不会改变该产品基线；安装包以同包的 `build-provenance.json` 记录的 commit、run ID 和 build 为准。完整结项范围见 [CLOSEOUT.md](CLOSEOUT.md) 与 [VERIFICATION.md](VERIFICATION.md)。
 
 ---
 
@@ -34,7 +34,7 @@ iOS 原生双摄像头同时录制 App（SwiftUI + `AVCaptureMultiCamSession` + 
 | 视频防抖 | A/B 两路分别开启/关闭 |
 | 空间音频 | 双文件模式原生支持（First Order Ambisonics + 立体声兼容轨），自动能力探测 |
 | 录制模式 A | 两路合成为**单条 MP4**（构图跟随录制前预览布局：**成片小窗位置 = 录制开始时的预览位置，拍后固定；小窗圆角与预览一致**），HEVC + 立体声 AAC |
-| 录制模式 B | 输出**两条独立 MP4**，同一会话时钟、同一时刻启动，时间戳同源帧级对齐 |
+| 录制模式 B | 输出**两条独立 MP4**；两路在同一会话中启动并使用同一会话时钟。当前验收覆盖正常录制与保存，不将此表述为所有条件下逐帧文件级对齐保证 |
 | 自动保存 | 录制结束自动存入系统相册（仅申请写入权限） |
 | 拍摄地点 | 开关打开时把拍摄地点写入视频元数据（仅保存在本地相册，不上传；未授权定位则不写入） |
 | 方向系统 | 横竖屏不锁、录制中锁方向（OrientationLockView）；后置用系统标准角度映射、前置独立映射（iPhone 前置传感器竖装），旋转后画面始终正向 |
@@ -115,7 +115,7 @@ open DualCamSync.xcodeproj
 - 镜头组合是否支持由 `CameraPairProbe` 用独立会话做 `canAddInput` 探测并缓存，选摄面板据此置灰。
 
 ### 时间戳对齐（模式B）
-- 两个 `AVCaptureMovieFileOutput` 在**同一瞬间** `startRecording`，共享同一会话时钟 → 两文件起点一致、逐帧对齐；每文件内音视频混流由 AVFoundation 内部完成，天然不漂移。
+- 两个 `AVCaptureMovieFileOutput` 由同一会话协调启动并共享会话时钟。当前真机验收覆盖正常的双文件录制、保存和回放；文件级逐帧对齐、长时间漂移和所有异常结束条件均未在本次结项范围内量化保证。
 
 ### 音画同步（模式A）
 - `AVCaptureMultiCamSession` 把所有设备时钟同步到 `masterClock`，各路样本 PTS 处于同一时间基准，写入 `AVAssetWriter` 即帧级对齐；首样本时间作为 `startSession(atSourceTime:)` 起点。

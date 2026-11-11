@@ -14,7 +14,8 @@
 | `9d1b006` / CI `42191001282` | HDR 格式选择、P010 配置顺序与 HEVC 输出修复；37 项 XCTest、设备 Release 构建和 IPA 打包通过 |
 | `59217a4` / CI `42996696902` | 首帧前中止后重录的收尾修复；37 项 XCTest、设备 Release 构建和 IPA 打包通过 |
 | `a8d7dea` / [CI `43022552676`](https://github.com/YunzeChU/DualCamSync/actions/runs/43022552676) | 用户已验收的计时修复基线；41 项 XCTest、设备 Release 构建和 IPA 打包通过 |
-| 本文所在的设置页收尾提交 | 最终交付包必须来自该提交自己的成功 CI；实际 SHA、run ID、build 由包旁 `build-provenance.json` 与启动 revision 日志对应，不能使用旧 CI 结果替代 |
+| `49f0ac5` / [CI `43023968187`](https://github.com/YunzeChU/DualCamSync/actions/runs/43023968187) | 冻结的最终产品基线；41 项 XCTest、设备 Release 构建和 IPA 打包通过，artifact 为 [13856596856](https://github.com/YunzeChU/DualCamSync/actions/runs/43023968187/artifacts/13856596856) |
+| 本文及 CLOSEOUT 文档提交 | 仅更新结项文档，不改变产品基线；若单独触发 CI，它是文档提交的可追溯证据，不替代 `49f0ac5` 的交付构建 |
 
 营销版本 `1.0.0` 不区分这些代码版本。安装时核对同包的 commit 和 run ID，仅安装最终成功构建的一份 IPA。
 
