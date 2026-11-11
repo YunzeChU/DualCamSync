@@ -45,18 +45,27 @@ final class ModeARecorderTests: XCTestCase {
 
     func testAbortBeforeFirstFrameReportsOnceAndAllowsRestart() throws {
         let recorder = ModeARecorder()
-        let failed = expectation(description: "one error")
-        failed.assertForOverFulfill = true
-        recorder.onError = { _ in failed.fulfill() }
-        try startEmpty(recorder)
-        recorder.abort(error: CameraError.recordingFailed("injected failure"))
-        recorder.abort(error: CameraError.recordingFailed("duplicate failure"))
-        wait(for: [failed], timeout: 2)
-        let finished = expectation(description: "restart")
-        recorder.onFinished = { _ in finished.fulfill() }
-        try startEmpty(recorder)
-        recorder.stop()
-        wait(for: [finished], timeout: 2)
+        // Reuse the same recorder through repeated startup aborts. Framework
+        // teardown of an unused writer must not delay its terminal callback or
+        // leave a pending abort that terminates the next recording.
+        for attempt in 0..<3 {
+            let failed = expectation(description: "one startup error \(attempt)")
+            failed.assertForOverFulfill = true
+            recorder.onError = { _ in failed.fulfill() }
+            try startEmpty(recorder)
+            recorder.abort(error: CameraError.recordingFailed("injected failure"))
+            recorder.abort(error: CameraError.recordingFailed("duplicate failure"))
+            wait(for: [failed], timeout: 2)
+            let finished = expectation(description: "restart \(attempt)")
+            finished.assertForOverFulfill = true
+            recorder.onFinished = { urls in
+                XCTAssertTrue(urls.isEmpty)
+                finished.fulfill()
+            }
+            try startEmpty(recorder)
+            recorder.stop()
+            wait(for: [finished], timeout: 2)
+        }
     }
 
     func testPairingToleratesEitherArrivalOrder() {

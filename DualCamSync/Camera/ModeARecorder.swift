@@ -592,7 +592,11 @@ final class ModeARecorder: NSObject,
         }
         let callback = onError
         let file = outputURL?.lastPathComponent ?? "unknown"
-        writer?.cancelWriting()
+        // No samples have started the writer in the common startup-abort case.
+        // cancelWriting is synchronous and can wait for framework initialization;
+        // an .unknown writer has no writing session to cancel. Releasing it is
+        // sufficient, and must not hold up the recorder's restart notification.
+        if writer?.status == .writing { writer?.cancelWriting() }
         print("[ModeA] failure file=\(file) error=\(error.localizedDescription)")
         accepting = false; isRecording = false; finishing = false
         generation = UUID()
@@ -611,7 +615,9 @@ final class ModeARecorder: NSObject,
         guard let writer, isWriting else {
             logTailSummary(event: "finish-empty", writerStatus: writer?.status,
                            writerError: writer?.error)
-            self.writer?.cancelWriting()
+            // A quick stop before the first pair never called startWriting.
+            // Do not synchronously cancel that unused (.unknown) writer.
+            if self.writer?.status == .writing { self.writer?.cancelWriting() }
             if let url { try? FileManager.default.removeItem(at: url) }
             isRecording = false; finishing = false
             clear()
